@@ -2,28 +2,24 @@ $HostName = "192.168.2.250"
 $Port = 8022
 $User = "u0_a124"
 $KeyPath = "$HOME\.ssh\id_rsa"
-$RemoteGitPath = "/data/data/com.termux/files/home/bot.git"
-$RemoteWorkTree = "/data/data/com.termux/files/home/bot"
 
-Write-Host "Updating Termux packages and installing Git..." -ForegroundColor Cyan
+Write-Host "Re-initializing bare Git repo in Termux home..." -ForegroundColor Cyan
 
-# Run commands cleanly over SSH without complex heredoc parsing bugs
-ssh -p $Port -i $KeyPath "$User@$HostName" "pkg update -y && pkg install -y git"
-
-Write-Host "Configuring remote bare Git repo and auto-checkout hook..." -ForegroundColor Cyan
-
-$remoteSetup = @"
-rm -rf $RemoteGitPath
-git init --bare $RemoteGitPath
-mkdir -p $RemoteGitPath/hooks
-echo '#!/bin/bash' > $RemoteGitPath/hooks/post-receive
-echo 'git --work-tree=$RemoteWorkTree --git-dir=$RemoteGitPath checkout -f' >> $RemoteGitPath/hooks/post-receive
-chmod +x $RemoteGitPath/hooks/post-receive
-echo 'Bare repo and post-receive hook ready.'
+$remoteFix = @"
+rm -rf ~/bot.git ~/bot
+git init --bare ~/bot.git
+mkdir -p ~/bot.git/hooks ~/bot
+echo '#!/bin/bash' > ~/bot.git/hooks/post-receive
+echo 'git --work-tree=$HOME/bot --git-dir=$HOME/bot.git checkout -f' >> ~/bot.git/hooks/post-receive
+chmod +x ~/bot.git/hooks/post-receive
+echo 'Remote bare repo and hook re-initialized successfully.'
 "@
 
-ssh -p $Port -i $KeyPath "$User@$HostName" $remoteSetup
+ssh -p $Port -i $KeyPath "$User@$HostName" $remoteFix
+
+Write-Host "Updating local Git remote URL..." -ForegroundColor Cyan
+Set-Location "C:\Users\trevo\bot"
+git remote set-url phone "ssh://$User@$HostName`:$Port/~/bot.git"
 
 Write-Host "Pushing code to phone..." -ForegroundColor Cyan
-Set-Location "C:\Users\trevo\bot"
 git push -u phone master --force
