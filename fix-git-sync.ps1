@@ -5,22 +5,24 @@ $KeyPath = "$HOME\.ssh\id_rsa"
 $RemoteGitPath = "/data/data/com.termux/files/home/bot.git"
 $RemoteWorkTree = "/data/data/com.termux/files/home/bot"
 
-Write-Host "Installing Git on Termux and configuring remote repo..." -ForegroundColor Cyan
+Write-Host "Updating Termux packages and installing Git..." -ForegroundColor Cyan
 
-$remoteCommands = @"
-pkg install -y git
+# Run commands cleanly over SSH without complex heredoc parsing bugs
+ssh -p $Port -i $KeyPath "$User@$HostName" "pkg update -y && pkg install -y git"
+
+Write-Host "Configuring remote bare Git repo and auto-checkout hook..." -ForegroundColor Cyan
+
+$remoteSetup = @"
 rm -rf $RemoteGitPath
 git init --bare $RemoteGitPath
 mkdir -p $RemoteGitPath/hooks
-cat << 'EOF' > $RemoteGitPath/hooks/post-receive
-#!/bin/bash
-git --work-tree=$RemoteWorkTree --git-dir=$RemoteGitPath checkout -f
-EOF
+echo '#!/bin/bash' > $RemoteGitPath/hooks/post-receive
+echo 'git --work-tree=$RemoteWorkTree --git-dir=$RemoteGitPath checkout -f' >> $RemoteGitPath/hooks/post-receive
 chmod +x $RemoteGitPath/hooks/post-receive
-echo "Remote repository and hook configured successfully."
+echo 'Bare repo and post-receive hook ready.'
 "@
 
-ssh -p $Port -i $KeyPath "$User@$HostName" $remoteCommands
+ssh -p $Port -i $KeyPath "$User@$HostName" $remoteSetup
 
 Write-Host "Pushing code to phone..." -ForegroundColor Cyan
 Set-Location "C:\Users\trevo\bot"
