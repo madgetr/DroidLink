@@ -30,6 +30,7 @@ SENSORS = {
 NAME_TO_KEY = {v: k for k, v in SENSORS.items()}
 
 SENSOR_INTERVAL_MS = 200
+STALL_TIMEOUT_S = 10
 BATTERY_INTERVAL_S = 30
 
 
@@ -75,6 +76,9 @@ class SensorHub:
     async def stop(self):
         for t in self._tasks:
             t.cancel()
+        await self._kill_stream()
+
+    async def _kill_stream(self):
         # termux-sensor is a bash wrapper around a termux-api child, so kill the
         # whole process group, not just the wrapper.
         if self._proc and self._proc.returncode is None:
@@ -82,6 +86,10 @@ class SensorHub:
                 os.killpg(self._proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                os.killpg(self._proc.pid, signal.SIGKILL)
         # Release the sensor listeners held by the Termux:API service.
         # This can hang, so never let it block shutdown.
         p = await asyncio.create_subprocess_exec(
@@ -103,7 +111,16 @@ class SensorHub:
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 buf = ""
                 while True:
-                    chunk = await self._proc.stdout.read(4096)
+                    # Watchdog: a freshly started listener sometimes never gets
+                    # data. If nothing arrives for a while, restart the stream.
+                    try:
+                        chunk = await asyncio.wait_for(
+                            self._proc.stdout.read(4096), timeout=STALL_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        self.error = f"no sensor data for {STALL_TIMEOUT_S}s, restarting stream"
+                        log.warning(self.error)
+                        await self._kill_stream()
+                        break
                     if not chunk:
                         break
                     buf += chunk.decode(errors="replace")
@@ -118,9 +135,10 @@ class SensorHub:
                             break  # incomplete object, wait for more data
                         buf = buf[end:]
                         self._ingest(obj)
-                err = (await self._proc.stderr.read()).decode(errors="replace").strip()
-                self.error = f"termux-sensor exited: {err or self._proc.returncode}"
-                log.warning(self.error)
+                if self._proc.returncode is not None:
+                    err = (await self._proc.stderr.read()).decode(errors="replace").strip()
+                    self.error = f"termux-sensor exited: {err or self._proc.returncode}"
+                    log.warning(self.error)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # keep the loop alive no matter what
