@@ -6,7 +6,7 @@ own message format.
 
 Movement mode: "auto" (default) uses the phone's /control endpoints and falls back
 to asking a human to move the droid while no droid is connected; "manual" always
-asks the human; "motors" never falls back.
+asks the human; "motors" never falls back; "sim" pretends to move (for testing).
 """
 
 import time
@@ -135,6 +135,8 @@ class DroidTools:
             raise
 
     def tool_turn(self, degrees: float) -> list[dict]:
+        if self.movement == "sim":
+            return _text(f"(simulated) turned {degrees:+.0f}°")
         r = self._motors(self.bridge.turn, degrees)
         if r is not None:
             note = "" if r["result"] == "done" else f" (stopped early: {r['result']})"
@@ -151,6 +153,8 @@ class DroidTools:
         return _text(f"turned {actual:+.0f}° (requested {degrees:+.0f}°); heading now {after:.0f}°")
 
     def tool_drive(self, distance_cm: float) -> list[dict]:
+        if self.movement == "sim":
+            return _text(f"(simulated) drove {distance_cm:+.0f} cm")
         r = self._motors(self.bridge.drive, distance_cm)
         if r is not None:
             note = "" if r["result"] == "done" else f" (stopped early: {r['result']})"

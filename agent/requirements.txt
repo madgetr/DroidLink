@@ -1,1 +1,3 @@
 anthropic
+opencv-contrib-python
+numpy

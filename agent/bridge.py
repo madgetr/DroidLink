@@ -3,6 +3,7 @@
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # DroidLink app on the phone. (The old Termux FastAPI server is on port 8000.)
@@ -21,6 +22,7 @@ class Snapshot:
         self.azimuth = _maybe_float(headers.get("X-Azimuth"))
         self.pitch = _maybe_float(headers.get("X-Pitch"))
         self.roll = _maybe_float(headers.get("X-Roll"))
+        self.torch = headers.get("X-Torch") == "on"       # flashlight was on for this shot
 
 
 def _maybe_float(v):
@@ -49,6 +51,11 @@ class DroidBridge:
         body, _ = self._get("/sensors")
         return json.loads(body)
 
+    def yaw(self) -> float | None:
+        """Gyro heading in degrees (continuous; good for 'turn back to where X was')."""
+        body, _ = self._get("/sensors/orientation")
+        return json.loads(body).get("yaw")
+
     def snapshot(self, camera: int = 2, width: int = 1280) -> Snapshot:
         body, headers = self._get(f"/camera/snapshot?camera={camera}&width={width}")
         return Snapshot(body, headers)
@@ -59,14 +66,82 @@ class DroidBridge:
         body, _ = self._get("/control/status")
         return json.loads(body)
 
-    def turn(self, degrees: float) -> dict:
-        body, _ = self._get(f"/control/turn?degrees={degrees:.1f}")
+    def turn(self, degrees: float, tolerance: float = 5, attempts: int = 5) -> dict:
+        """Gyro-guided turn. Quick turns: bigger tolerance, fewer correction attempts."""
+        body, _ = self._get(f"/control/turn?degrees={degrees:.1f}&tolerance={tolerance:.0f}&attempts={attempts}")
+        return json.loads(body)
+
+    def velocity(self, left: float, right: float, ttl_ms: int = 400) -> dict:
+        """Continuous driving: set wheel speeds (-1..1). The phone stops the motors by
+        itself if no update arrives within ttl_ms (dead-man switch)."""
+        body, _ = self._get(f"/control/velocity?left={left:.3f}&right={right:.3f}&ttl_ms={ttl_ms}")
         return json.loads(body)
 
     def drive(self, cm: float) -> dict:
         body, _ = self._get(f"/control/drive?cm={cm:.1f}")
         return json.loads(body)
 
+    def droid_connect(self) -> dict:
+        """Connect the phone to the droid (finds it if needed). Takes the droid away
+        from its handheld remote until droid_disconnect()."""
+        body, _ = self._get("/droid/connect")
+        return json.loads(body)
+
+    def droid_disconnect(self) -> dict:
+        """Release the droid so its handheld remote works again."""
+        body, _ = self._get("/droid/disconnect")
+        return json.loads(body)
+
     def stop(self) -> dict:
         body, _ = self._get("/control/stop")
+        return json.loads(body)
+
+    def torch(self, mode: str) -> dict:
+        """Set the saved flashlight mode: "on", "off" or "auto" (on when it's dark)."""
+        body, _ = self._get(f"/camera/torch?mode={mode}")
+        return json.loads(body)
+
+    def light_off(self) -> dict:
+        """Switch the flashlight off now, without changing the saved mode."""
+        body, _ = self._get("/camera/torch?light=off")
+        return json.loads(body)
+
+    def listen(self, seconds: float = 6, cue: bool = True) -> dict:
+        """Chirp (if cue) and listen for one utterance. {"text": "...", ...}; "" if silence."""
+        body, _ = self._get(f"/voice/listen?seconds={seconds:.1f}&cue={'1' if cue else '0'}")
+        return json.loads(body)
+
+    def wake(self, enable: bool, names: list[str] | None = None) -> dict:
+        """Turn background listening for the droid's name on or off."""
+        q = f"/voice/wake?enable={'1' if enable else '0'}"
+        if names:
+            q += "&names=" + urllib.parse.quote(",".join(names))
+        body, _ = self._get(q)
+        return json.loads(body)
+
+    def voice_events(self, since: int) -> dict:
+        """Times the droid heard its name: {"next": n, "items": [{"text", "command"}, ...]}"""
+        body, _ = self._get(f"/voice/events?since={since}")
+        return json.loads(body)
+
+    def overlay(self, box=None, label: str = "", status: str = "", color: str = "green") -> None:
+        """Draw what the brain is tracking on the live /camera/stream (box = vision.Box)."""
+        q = {"label": label, "status": status, "color": color}
+        if box is not None:
+            q.update(x1=f"{box.x1:.3f}", y1=f"{box.y1:.3f}", x2=f"{box.x2:.3f}", y2=f"{box.y2:.3f}")
+        self._get("/camera/overlay?" + urllib.parse.urlencode(q))
+
+    def settings(self) -> dict:
+        """The droid's saved settings (name, voice) from the phone app."""
+        body, _ = self._get("/settings")
+        return json.loads(body)
+
+    # --- voice (DroidLink 0.3+)
+
+    def chirp(self, mood: str) -> dict:
+        body, _ = self._get(f"/sound/chirp?mood={mood}")
+        return json.loads(body)
+
+    def speak(self, text: str) -> dict:
+        body, _ = self._get("/sound/speak?text=" + urllib.parse.quote(text))
         return json.loads(body)
