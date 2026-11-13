@@ -1,2 +1,6 @@
 *.sh text eol=lf
 *.py text eol=lf
+gradlew text eol=lf
+*.bat text eol=crlf
+*.kt text eol=lf
+*.kts text eol=lf
