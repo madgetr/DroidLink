@@ -4,14 +4,15 @@ Each tool returns a list of parts: {"type": "text", "text": ...} or
 {"type": "image", "jpeg": bytes}. Each agent backend converts these into its
 own message format.
 
-Movement isn't wired to the droid yet, so turn/drive run in "manual" mode:
-the agent asks a human to move the droid, then checks the compass.
+Movement mode: "auto" (default) uses the phone's /control endpoints and falls back
+to asking a human to move the droid while no droid is connected; "manual" always
+asks the human; "motors" never falls back.
 """
 
 import time
 from pathlib import Path
 
-from agent.bridge import DroidBridge
+from agent.bridge import DroidBridge, Unavailable
 
 CAMERAS = {"ultrawide": 2, "main": 0}
 
@@ -74,7 +75,7 @@ def _text(s: str) -> list[dict]:
 
 
 class DroidTools:
-    def __init__(self, bridge: DroidBridge, run_dir: Path, movement: str = "manual",
+    def __init__(self, bridge: DroidBridge, run_dir: Path, movement: str = "auto",
                  image_width: int = 1280):
         self.bridge = bridge
         self.run_dir = run_dir
@@ -121,13 +122,27 @@ class DroidTools:
             lines.append(f"battery {b.get('percentage')}% ({b.get('status', '').lower()})")
         return _text("\n".join(lines) or "no sensor data")
 
-    def tool_turn(self, degrees: float) -> list[dict]:
-        before = self._heading()
+    def _motors(self, move, *args) -> dict | None:
+        """Run a move on the droid; None means 'do it by hand' (no droid connected)."""
         if self.movement == "manual":
-            side = "RIGHT" if degrees > 0 else "LEFT"
-            input(f"\n>>> Please turn the droid {side} {abs(degrees):.0f}° and press Enter... ")
-        else:
-            raise NotImplementedError("BLE movement not wired up yet")
+            return None
+        try:
+            return move(*args)
+        except Unavailable as e:
+            if self.movement == "auto":
+                print(f"   [{e}; moving by hand instead]")
+                return None
+            raise
+
+    def tool_turn(self, degrees: float) -> list[dict]:
+        r = self._motors(self.bridge.turn, degrees)
+        if r is not None:
+            note = "" if r["result"] == "done" else f" (stopped early: {r['result']})"
+            return _text(f"turned {r['turned']:+.0f}° (requested {degrees:+.0f}°); "
+                         f"heading now {r['heading']:.0f}°{note}")
+        before = self._heading()
+        side = "RIGHT" if degrees > 0 else "LEFT"
+        input(f"\n>>> Please turn the droid {side} {abs(degrees):.0f}° and press Enter... ")
         time.sleep(0.5)  # let the compass settle
         after = self._heading()
         if before is None or after is None:
@@ -136,11 +151,12 @@ class DroidTools:
         return _text(f"turned {actual:+.0f}° (requested {degrees:+.0f}°); heading now {after:.0f}°")
 
     def tool_drive(self, distance_cm: float) -> list[dict]:
-        if self.movement == "manual":
-            way = "FORWARD" if distance_cm > 0 else "BACKWARD"
-            input(f"\n>>> Please move the droid {way} {abs(distance_cm):.0f} cm and press Enter... ")
-        else:
-            raise NotImplementedError("BLE movement not wired up yet")
+        r = self._motors(self.bridge.drive, distance_cm)
+        if r is not None:
+            note = "" if r["result"] == "done" else f" (stopped early: {r['result']})"
+            return _text(f"drove about {r['estimated_cm']:+.0f} cm{note}")
+        way = "FORWARD" if distance_cm > 0 else "BACKWARD"
+        input(f"\n>>> Please move the droid {way} {abs(distance_cm):.0f} cm and press Enter... ")
         return _text(f"drove {distance_cm:+.0f} cm")
 
     def _heading(self):
