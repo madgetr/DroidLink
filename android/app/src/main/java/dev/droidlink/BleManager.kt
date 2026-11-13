@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -41,9 +42,16 @@ class BleManager(private val ctx: Context) {
 
     // ---------------------------------------------------------------- scan
 
-    fun scan(seconds: Double, nameFilter: String?): JSONArray {
+    /**
+     * Scan for [seconds]. Android silently returns nothing for *unfiltered* scans
+     * while the screen is off, so pass [exactName] and/or [manufacturerId] when
+     * looking for something specific; those use real scan filters.
+     */
+    fun scan(seconds: Double, nameFilter: String?, exactName: String? = null,
+             manufacturerId: Int? = null): JSONArray {
         val scanner = adapter?.bluetoothLeScanner
             ?: throw IllegalStateException("Bluetooth is off")
+        respectScanBudget()
         val found = ConcurrentHashMap<String, JSONObject>()
         val cb = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, r: ScanResult) {
@@ -63,7 +71,12 @@ class BleManager(private val ctx: Context) {
             }
         }
         val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-        scanner.startScan(null, settings, cb)
+        // Several filters = match ANY of them, in a single scan
+        val filters = buildList {
+            exactName?.let { add(ScanFilter.Builder().setDeviceName(it).build()) }
+            manufacturerId?.let { add(ScanFilter.Builder().setManufacturerData(it, ByteArray(0)).build()) }
+        }
+        scanner.startScan(filters.ifEmpty { null }, settings, cb)
         try {
             Thread.sleep((seconds * 1000).toLong())
         } finally {
@@ -73,6 +86,23 @@ class BleManager(private val ctx: Context) {
             .filter { nameFilter.isNullOrEmpty() || it.optString("name").contains(nameFilter, ignoreCase = true) }
             .sortedByDescending { it.getInt("rssi") }
         return JSONArray(list)
+    }
+
+    /**
+     * Android silently returns *empty* scans for an app that starts more than 5
+     * scans in 30 s. Wait if we're about to hit that, instead of getting nothing.
+     */
+    private val scanStarts = ArrayDeque<Long>()
+    private fun respectScanBudget() = synchronized(scanStarts) {
+        val now = System.currentTimeMillis()
+        while (scanStarts.isNotEmpty() && now - scanStarts.first() > SCAN_WINDOW_MS) scanStarts.removeFirst()
+        if (scanStarts.size >= MAX_SCANS_PER_WINDOW) {
+            val wait = SCAN_WINDOW_MS - (now - scanStarts.first()) + 500
+            Log.i(TAG, "scan budget used up, waiting ${wait} ms")
+            Thread.sleep(wait)
+            scanStarts.removeFirst()
+        }
+        scanStarts.addLast(System.currentTimeMillis())
     }
 
     // ---------------------------------------------------------- connection
@@ -102,6 +132,8 @@ class BleManager(private val ctx: Context) {
         state = "disconnected"
     }
 
+    fun isConnected() = state == "connected" && gatt != null
+
     fun status(): JSONObject = JSONObject()
         .put("state", state)
         .put("address", gatt?.device?.address ?: JSONObject.NULL)
@@ -124,14 +156,24 @@ class BleManager(private val ctx: Context) {
         val g = requireGatt()
         val c = findChar(charUuid)
         val bytes = hex.hexToBytes()
-        val type = if (withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                   else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-        try {
-            op(if (withResponse) 5_000 else 1_000) {
-                g.writeCharacteristic(c, bytes, type) == BluetoothStatusCodes.SUCCESS
+        if (withResponse) {
+            op(5_000) {
+                g.writeCharacteristic(c, bytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
+                    BluetoothStatusCodes.SUCCESS
             }
-        } catch (e: TimeoutException) {
-            if (withResponse) throw e // no-response writes may not report back; that's fine
+        } else {
+            // Fire-and-forget (motor updates): don't wait for a callback, which
+            // can stall the control loop for up to a second. Just retry briefly
+            // if the BLE stack is still busy with the previous packet.
+            synchronized(opLock) {
+                var rc = -1
+                for (attempt in 0 until 40) {
+                    rc = g.writeCharacteristic(c, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE)
+                    if (rc == BluetoothStatusCodes.SUCCESS) break
+                    Thread.sleep(5)
+                }
+                if (rc != BluetoothStatusCodes.SUCCESS) throw IllegalStateException("BLE write failed ($rc)")
+            }
         }
         return JSONObject().put("written", bytes.size).put("char", c.uuid.toString())
     }
@@ -217,7 +259,15 @@ class BleManager(private val ctx: Context) {
         val f = CompletableFuture<Any?>()
         pending = f
         try {
-            if (!start()) throw IllegalStateException("BLE operation could not be started")
+            // The stack refuses new operations while earlier packets (e.g. fire-and-
+            // forget motor writes) are still queued; wait briefly and retry.
+            var started = start()
+            var tries = 0
+            while (!started && tries++ < 40) {
+                Thread.sleep(5)
+                started = start()
+            }
+            if (!started) throw IllegalStateException("BLE operation could not be started")
             f.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: java.util.concurrent.ExecutionException) {
             throw (e.cause ?: e)
@@ -248,6 +298,8 @@ class BleManager(private val ctx: Context) {
     companion object {
         private const val TAG = "BleManager"
         private const val MAX_NOTIFICATIONS = 500
+        private const val MAX_SCANS_PER_WINDOW = 4     // Android's limit is 5 per 30 s
+        private const val SCAN_WINDOW_MS = 30_000L
         private val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         /** Accept full UUIDs or 16-bit short forms like "ffe1". */

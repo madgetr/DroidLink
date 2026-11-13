@@ -9,6 +9,8 @@ interface MotorDriver {
     val name: String
     val connected: Boolean
     fun drive(left: Double, right: Double)
+    /** Rotate the head/dome (-1..1); not every droid has one. */
+    fun head(speed: Double): Unit = throw Unavailable("this droid has no head motor")
     fun stop()
 }
 
@@ -26,15 +28,36 @@ class NoMotorDriver : MotorDriver {
  * - every move stops on a bump (sudden jolt), a tilt (tipping or an edge),
  *   a /control/stop request, or a timeout
  */
-class MotionController(private val sensors: SensorHub, @Volatile var driver: MotorDriver) {
-
-    // Tunables (calibrate once the real droid is connected)
-    var turnSpeed = 0.5          // motor power while turning
-    var driveSpeed = 0.5         // motor power while driving
-    var cmPerSecond = 20.0       // how far the droid drives per second at driveSpeed
+class MotionController(
+    private val sensors: SensorHub,
+    @Volatile var driver: MotorDriver,
+    private val settings: Settings,
+) {
+    // Tunables, saved in Settings and adjustable via /control/config
+    private val turnSpeed get() = settings.turnPower.toDouble()     // motor power while turning
+    private val driveSpeed get() = settings.drivePower.toDouble()   // motor power while driving
+    private val cmPerSecond get() = settings.cmPerSecond.toDouble() // drive speed at driveSpeed
+    private val minPower get() = settings.minPower.toDouble()       // below this the wheels stall
+    private val coastS get() = settings.coastS.toDouble()           // stop this many seconds early
     var turnToleranceDeg = 5.0
     var bumpThreshold = 8.0      // m/s^2 of linear acceleration that counts as a bump
     var tiltLimitDeg = 20.0      // max change in pitch/roll from the start of a move
+
+    fun config(turnPower: Float?, drivePower: Float?, minPower: Float?, cmPerSecond: Float?,
+               coastS: Float? = null, rampMs: Int? = null, easeDeg: Float? = null): JSONObject {
+        turnPower?.let { settings.turnPower = it }
+        drivePower?.let { settings.drivePower = it }
+        minPower?.let { settings.minPower = it }
+        cmPerSecond?.let { settings.cmPerSecond = it }
+        coastS?.let { settings.coastS = it }
+        rampMs?.let { settings.rampMs = it }
+        easeDeg?.let { settings.easeDeg = it }
+        return JSONObject()
+            .put("turn_power", settings.turnPower).put("drive_power", settings.drivePower)
+            .put("min_power", settings.minPower).put("cm_per_second", settings.cmPerSecond)
+            .put("coast_s", settings.coastS).put("ramp_ms", settings.rampMs)
+            .put("ease_deg", settings.easeDeg)
+    }
 
     @Volatile private var stopRequested = false
     @Volatile private var activeMove: String? = null
@@ -46,37 +69,291 @@ class MotionController(private val sensors: SensorHub, @Volatile var driver: Mot
         .put("connected", driver.connected)
         .put("moving", activeMove ?: JSONObject.NULL)
         .put("heading", sensors.azimuth.takeUnless { it.isNaN() } ?: JSONObject.NULL)
+        .put("yaw", sensors.yaw.takeUnless { it.isNaN() } ?: JSONObject.NULL)
         .put("last", lastResult ?: JSONObject.NULL)
 
     fun stop(): JSONObject {
         stopRequested = true
+        velDeadline = 0
         driver.stop()
         return status()
     }
 
-    /** Rotate in place by [degrees] (positive = right/clockwise from above). */
-    fun turn(degrees: Double, timeoutS: Double = 10.0): JSONObject = move("turn") { guard ->
-        val start = sensors.azimuth
-        if (start.isNaN()) throw Unavailable("no compass heading")
-        val target = (start + degrees + 360) % 360
-        var reason = "timeout"
+    /** Someone called the droid: stop now and refuse movement for [ms], so commands
+     *  already on their way from the laptop can't start the motors again. */
+    @Volatile private var holdUntil = 0L
+
+    fun hold(ms: Long) {
+        holdUntil = System.currentTimeMillis() + ms
+        stop()
+    }
+
+    private fun checkHold() {
+        if (System.currentTimeMillis() < holdUntil) throw Unavailable("paused: someone called my name")
+    }
+
+    // --- velocity mode: the laptop streams wheel speeds for continuous driving.
+    // Dead-man switch: if updates stop arriving for ttl ms, the motors stop.
+
+    @Volatile private var velLeft = 0.0
+    @Volatile private var velRight = 0.0
+    @Volatile private var velDeadline = 0L
+    @Volatile private var velThread: Thread? = null
+    @Volatile private var velEnded: String? = null      // why velocity mode last ended
+
+    fun velocity(left: Double, right: Double, ttlMs: Long): JSONObject {
+        if (!driver.connected) throw Unavailable("no droid connected")
+        if (left != 0.0 || right != 0.0) checkHold()
+        velLeft = left.coerceIn(-1.0, 1.0)
+        velRight = right.coerceIn(-1.0, 1.0)
+        velDeadline = System.currentTimeMillis() + ttlMs.coerceIn(50, 2_000)
+        if (velThread?.isAlive != true) {
+            velEnded = null
+            velThread = kotlin.concurrent.thread(name = "velocity") {
+                velEnded = try {
+                    move("velocity", VELOCITY_BUMP) { guard ->
+                        var reason = "released"
+                        while (System.currentTimeMillis() < velDeadline) {
+                            val g = guard(); if (g != null) { reason = g; break }
+                            driver.drive(velLeft, velRight)
+                            Thread.sleep(20)
+                        }
+                        driver.stop()
+                        JSONObject().put("result", reason)
+                    }.optString("result")
+                } catch (e: Exception) {
+                    "error: ${e.message}"
+                }
+            }
+        }
+        return JSONObject()
+            .put("active", velThread?.isAlive == true)
+            .put("ended", velEnded ?: JSONObject.NULL)   // e.g. "bump" if the guard stopped us
+            .put("yaw", sensors.yaw.takeUnless { it.isNaN() } ?: JSONObject.NULL)
+    }
+
+    /**
+     * Rotate in place by [degrees] (positive = right/clockwise from above).
+     *
+     * Measured with the gyro (yaw), not the compass: the motors' magnets throw the
+     * compass off. The droid keeps turning briefly after a stop command, so we
+     * stop early by the predicted coast (spin rate x coastS), let it settle, and
+     * nudge slowly to fix any remaining error.
+     */
+    fun turn(degrees: Double, timeoutS: Double = 10.0, tolerance: Double = turnToleranceDeg,
+             maxAttempts: Int = 5): JSONObject = move("turn", TURN_BUMP) { guard ->
+        val y0 = sensors.yaw
+        if (y0.isNaN()) throw Unavailable("no gyro heading")
+        val target = y0 + degrees
         val deadline = System.currentTimeMillis() + (timeoutS * 1000).toLong()
-        while (System.currentTimeMillis() < deadline) {
+        var reason = "timeout"
+        var attempts = 0
+        var peakRate = 0.0
+        while (attempts < maxAttempts && System.currentTimeMillis() < deadline) {
+            attempts++
+            val err = target - sensors.yaw
+            if (abs(err) <= tolerance) { reason = "done"; break }
+            // First pass at full turn power; corrections at the gentlest power that moves
+            val power = if (attempts == 1) turnSpeed else minPower
+            val dir = sign(err)
+            var lastYaw = sensors.yaw
+            var lastT = System.nanoTime()
+            var rate = 0.0      // deg/s, smoothed
+            var stopReason: String? = null
+            while (System.currentTimeMillis() < deadline) {
+                stopReason = guard(); if (stopReason != null) break
+                val y = sensors.yaw
+                val t = System.nanoTime()
+                val dt = (t - lastT) / 1e9
+                if (dt >= 0.015) {
+                    rate = 0.6 * rate + 0.4 * ((y - lastYaw) / dt)
+                    lastYaw = y; lastT = t
+                    peakRate = maxOf(peakRate, abs(rate))
+                }
+                val remaining = target - y
+                if (sign(remaining) != dir) break                         // went past it
+                if (abs(remaining) <= maxOf(tolerance, abs(rate) * coastS)) break
+                // Ease off as we approach: full power far away, down to the
+                // minimum that still moves the droid as we close in.
+                val eased = (power * abs(remaining) / settings.easeDeg).coerceIn(minPower, power)
+                driver.drive(eased * dir, -eased * dir)
+                Thread.sleep(15)
+            }
+            driver.stop()
+            if (stopReason != null) { reason = stopReason; break }
+            Thread.sleep(400)   // let it coast to a stop
+        }
+        if (reason == "timeout" && abs(target - sensors.yaw) <= tolerance) reason = "done"
+        val turned = sensors.yaw - y0
+        JSONObject()
+            .put("requested", degrees)
+            .put("turned", Math.round(turned * 10) / 10.0)
+            .put("error", Math.round((degrees - turned) * 10) / 10.0)
+            .put("attempts", attempts)
+            .put("peak_rate", Math.round(peakRate))
+            .put("heading", sensors.azimuth)
+            .put("result", reason)
+    }
+
+    // --- head (dome). The phone rides on the head, so its gyro measures where the
+    // head points. Head and body never move at the same time, so every head move
+    // tells us exactly how far the head turned relative to the body.
+
+    /** Head angle relative to the body, degrees (+ = right). 0 = facing forward. */
+    @Volatile var headAngle = 0.0
+        private set
+
+    /** Declare the head to be facing straight ahead right now. */
+    fun headZero(): JSONObject {
+        headAngle = 0.0
+        return headStatus()
+    }
+
+    fun headStatus(): JSONObject = JSONObject().put("head_angle", Math.round(headAngle * 10) / 10.0)
+
+    /**
+     * Turn the head by [degrees] (+ = right), measured with the gyro, with the
+     * same ease-off / stop-early / correct approach as body turns.
+     */
+    fun headTurn(degrees: Double, tolerance: Double = 4.0, maxAttempts: Int = 4,
+                 timeoutS: Double = 8.0): JSONObject = move("head", TURN_BUMP, checkTilt = false) { guard ->
+        val y0 = sensors.yaw
+        if (y0.isNaN()) throw Unavailable("no gyro heading")
+        val target = y0 + degrees
+        val deadline = System.currentTimeMillis() + (timeoutS * 1000).toLong()
+        val sign = settings.headSign.toDouble()      // which motor direction turns the head right
+        var reason = "timeout"
+        var attempts = 0
+        while (attempts < maxAttempts && System.currentTimeMillis() < deadline) {
+            attempts++
+            val err = target - sensors.yaw
+            if (abs(err) <= tolerance) { reason = "done"; break }
+            val power = if (attempts == 1) settings.headPower.toDouble() else settings.headMinPower.toDouble()
+            val dir = sign(err)
+            var lastYaw = sensors.yaw
+            var lastT = System.nanoTime()
+            var rate = 0.0
+            var stopReason: String? = null
+            while (System.currentTimeMillis() < deadline) {
+                stopReason = guard(); if (stopReason != null) break
+                val y = sensors.yaw
+                val t = System.nanoTime()
+                val dt = (t - lastT) / 1e9
+                if (dt >= 0.015) {
+                    rate = 0.6 * rate + 0.4 * ((y - lastYaw) / dt)
+                    lastYaw = y; lastT = t
+                }
+                val remaining = target - y
+                if (sign(remaining) != dir) break
+                if (abs(remaining) <= maxOf(tolerance, abs(rate) * settings.headCoastS)) break
+                val eased = (power * abs(remaining) / settings.easeDeg)
+                    .coerceIn(settings.headMinPower.toDouble(), power)
+                driver.head(eased * dir * sign)
+                Thread.sleep(15)
+            }
+            driver.stop()
+            if (stopReason != null) { reason = stopReason; break }
+            Thread.sleep(300)
+        }
+        if (reason == "timeout" && abs(target - sensors.yaw) <= tolerance) reason = "done"
+        val turned = sensors.yaw - y0
+        headAngle += turned
+        JSONObject()
+            .put("requested", degrees)
+            .put("turned", Math.round(turned * 10) / 10.0)
+            .put("error", Math.round((degrees - turned) * 10) / 10.0)
+            .put("head_angle", Math.round(headAngle * 10) / 10.0)
+            .put("attempts", attempts)
+            .put("result", reason)
+    }
+
+    /** Point the head straight ahead again. */
+    fun headCenter(): JSONObject =
+        if (abs(headAngle) < 3) headStatus().put("result", "already centred") else headTurn(-headAngle)
+
+    /** Clamp a head turn so the head stays inside its calibrated range (never hits a stop). */
+    fun headClamp(degrees: Double): Double {
+        val half = settings.headHalfRange.toDouble()
+        if (half <= 0) return degrees                     // range not calibrated yet
+        val margin = 5.0
+        val target = (headAngle + degrees).coerceIn(-half + margin, half - margin)
+        return target - headAngle
+    }
+
+    /**
+     * Find the head's end stops: turn each way until the gyro says it has stopped
+     * moving, then centre between them. Saves the range, so head turns never push
+     * against a stop afterwards.
+     */
+    fun headCalibrate(): JSONObject = move("head_calibrate", TURN_BUMP, checkTilt = false) { guard ->
+        val sign = settings.headSign.toDouble()
+        val power = settings.headMinPower.toDouble()
+
+        fun runToStop(dir: Double): Double {
+            val t0 = System.currentTimeMillis()
+            var lastYaw = sensors.yaw
+            var lastMove = System.currentTimeMillis()
+            var moved = false
+            while (System.currentTimeMillis() - t0 < 6_000) {
+                if (guard() != null) break
+                driver.head(power * dir * sign)
+                Thread.sleep(40)
+                val y = sensors.yaw
+                if (abs(y - lastYaw) > 0.8) { lastMove = System.currentTimeMillis(); moved = true }
+                lastYaw = y
+                // Stalled: no rotation for a while (after it started, or never started)
+                if (System.currentTimeMillis() - lastMove > (if (moved) 250 else 1_000)) break
+            }
+            driver.stop()
+            Thread.sleep(300)
+            return sensors.yaw
+        }
+
+        val left = runToStop(-1.0)
+        val right = runToStop(+1.0)
+        val range = right - left
+        settings.headHalfRange = (range / 2).toFloat()
+        headAngle = range / 2                          // we're at the right stop now
+        JSONObject().put("range", Math.round(range)).put("half_range", Math.round(range / 2))
+            .put("note", "head is at its right stop; call /control/head/center")
+    }
+
+    /**
+     * Calibration: spin at [power] for [seconds] and record the gyro yaw (50 Hz)
+     * from before the start until well after the stop, all timed on the phone.
+     */
+    fun spinTest(power: Double, seconds: Double, head: Boolean = false): JSONObject =
+        move("spin_test", TURN_BUMP, checkTilt = !head) { guard ->
+        val samples = org.json.JSONArray()
+        val t0 = System.nanoTime()
+        fun ms() = (System.nanoTime() - t0) / 1e6
+        fun sample() = samples.put(org.json.JSONArray().put(Math.round(ms())).put(sensors.yaw))
+        repeat(10) { sample(); Thread.sleep(20) }            // 200 ms before
+        val startAt = ms()
+        var result = "done"
+        while (ms() - startAt < seconds.coerceIn(0.1, 2.0) * 1000) {
+            val g = guard(); if (g != null) { result = g; break }
+            if (head) driver.head(power) else driver.drive(power, -power)
+            sample(); Thread.sleep(20)
+        }
+        val stopAt = ms()   // when the stop is issued (the stop itself takes a moment)
+        driver.stop()
+        while (ms() - stopAt < 1500) { sample(); Thread.sleep(20) }   // coast + settle
+        JSONObject().put("power", power).put("start_at", startAt).put("stop_at", stopAt)
+            .put("result", result).put("samples", samples)
+    }
+
+    /** Run the wheels at fixed speeds (-1..1) for a short time. For testing and calibration. */
+    fun wheels(left: Double, right: Double, seconds: Double): JSONObject = move("wheels") { guard ->
+        val t0 = System.currentTimeMillis()
+        var reason = "done"
+        while (System.currentTimeMillis() - t0 < seconds.coerceIn(0.0, 3.0) * 1000) {
             val g = guard(); if (g != null) { reason = g; break }
-            val remaining = angleDiff(target, sensors.azimuth)
-            if (abs(remaining) <= turnToleranceDeg) { reason = "done"; break }
-            // Slow down near the target to avoid overshooting
-            val power = turnSpeed * (abs(remaining) / 45.0).coerceIn(0.4, 1.0) * sign(remaining)
-            driver.drive(power, -power)
+            driver.drive(left, right)
             Thread.sleep(20)
         }
         driver.stop()
-        Thread.sleep(150) // let the compass settle
-        JSONObject()
-            .put("requested", degrees)
-            .put("turned", angleDiff(sensors.azimuth, start))
-            .put("heading", sensors.azimuth)
-            .put("result", reason)
+        JSONObject().put("left", left).put("right", right).put("seconds", seconds).put("result", reason)
     }
 
     /** Drive straight [cm] (negative = backwards). Distance is time-based for now. */
@@ -99,18 +376,24 @@ class MotionController(private val sensors: SensorHub, @Volatile var driver: Mot
     }
 
     /** Runs one move at a time with the safety guard; always leaves the motors stopped. */
-    private fun move(kind: String, body: (guard: () -> String?) -> JSONObject): JSONObject {
+    private fun move(kind: String, bumpLimit: Double = bumpThreshold, checkTilt: Boolean = true,
+                     body: (guard: () -> String?) -> JSONObject): JSONObject {
         if (!driver.connected) throw Unavailable("no droid connected")
+        checkHold()
         synchronized(moveLock) {
             stopRequested = false
             activeMove = kind
             val pitch0 = sensors.pitch
             val roll0 = sensors.roll
+            val t0 = System.currentTimeMillis()
             val guard: () -> String? = {
+                // The motors' start-up jolt isn't a collision: ignore jolts briefly
+                val settled = System.currentTimeMillis() - t0 > BUMP_GRACE_MS
                 when {
                     stopRequested -> "stopped"
-                    sensors.linearAccel() > bumpThreshold -> "bump"
-                    abs(sensors.pitch - pitch0) > tiltLimitDeg || abs(sensors.roll - roll0) > tiltLimitDeg -> "tilt"
+                    settled && sensors.linearAccel() > bumpLimit -> "bump"
+                    checkTilt && (abs(sensors.pitch - pitch0) > tiltLimitDeg ||
+                        abs(sensors.roll - roll0) > tiltLimitDeg) -> "tilt"
                     else -> null
                 }
             }
@@ -124,6 +407,11 @@ class MotionController(private val sensors: SensorHub, @Volatile var driver: Mot
     }
 
     companion object {
+        /** Spinning jolts the off-centre phone; only a hard knock counts as a bump. */
+        private const val TURN_BUMP = 20.0
+        private const val VELOCITY_BUMP = 14.0   // steering while driving jolts the phone a bit
+        private const val BUMP_GRACE_MS = 400L
+
         /** Signed shortest angle from [b] to [a], degrees in -180..180. */
         fun angleDiff(a: Double, b: Double) = (a - b + 540) % 360 - 180
     }

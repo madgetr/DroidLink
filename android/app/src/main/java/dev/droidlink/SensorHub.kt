@@ -31,6 +31,7 @@ class SensorHub(private val ctx: Context) : SensorEventListener {
         Sensor.TYPE_GRAVITY to "gravity",
         Sensor.TYPE_LINEAR_ACCELERATION to "linear_acceleration",
         Sensor.TYPE_ROTATION_VECTOR to "rotation_vector",
+        Sensor.TYPE_GAME_ROTATION_VECTOR to "game_rotation_vector",
         Sensor.TYPE_LIGHT to "light",
         Sensor.TYPE_PRESSURE to "pressure",
         Sensor.TYPE_PROXIMITY to "proximity",
@@ -47,6 +48,15 @@ class SensorHub(private val ctx: Context) : SensorEventListener {
     @Volatile var roll = Double.NaN; private set      // sideways tilt of the phone
     @Volatile var poseTs = 0.0; private set
 
+    /**
+     * Gyro-based heading in degrees, continuous (keeps counting past 360) and
+     * immune to magnets like the droid's motors. Its zero point is arbitrary, so
+     * use it for relative turns, and the compass [azimuth] for absolute heading.
+     */
+    @Volatile var yaw = Double.NaN; private set
+    @Volatile var yawTs = 0.0; private set
+    private var lastRawYaw = Double.NaN
+
     fun start() {
         for ((type, _) in types) {
             sm.getDefaultSensor(type)?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
@@ -59,6 +69,18 @@ class SensorHub(private val ctx: Context) : SensorEventListener {
         val name = types[e.sensor.type] ?: return
         latest[name] = Reading(now(), e.values.clone())
         if (e.sensor.type == Sensor.TYPE_ROTATION_VECTOR) updatePose(e.values)
+        if (e.sensor.type == Sensor.TYPE_GAME_ROTATION_VECTOR) updateYaw(e.values)
+    }
+
+    private fun updateYaw(rv: FloatArray) {
+        val r = FloatArray(9)
+        SensorManager.getRotationMatrixFromVector(r, rv)
+        // Same camera-forward direction as the compass heading (see updatePose)
+        val raw = (Math.toDegrees(atan2(-r[2].toDouble(), -r[5].toDouble())) + 360) % 360
+        yaw = if (lastRawYaw.isNaN() || yaw.isNaN()) raw
+              else yaw + ((raw - lastRawYaw + 540) % 360 - 180)   // unwrap
+        lastRawYaw = raw
+        yawTs = now()
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -78,6 +100,9 @@ class SensorHub(private val ctx: Context) : SensorEventListener {
         poseTs = now()
     }
 
+    /** Ambient light in lux, or null if the light sensor hasn't reported yet. */
+    fun lux(): Float? = latest["light"]?.values?.get(0)
+
     /** Magnitude of linear acceleration (gravity removed), m/s^2. */
     fun linearAccel(): Double {
         val v = latest["linear_acceleration"]?.values ?: return 0.0
@@ -93,6 +118,7 @@ class SensorHub(private val ctx: Context) : SensorEventListener {
         if (!azimuth.isNaN()) {
             sensors.put("orientation", JSONObject()
                 .put("ts", poseTs).put("azimuth", azimuth).put("pitch", pitch).put("roll", roll)
+                .put("yaw", if (yaw.isNaN()) JSONObject.NULL else yaw)
                 .put("unit", "deg").put("age_s", round2(t - poseTs)))
         }
         return JSONObject()

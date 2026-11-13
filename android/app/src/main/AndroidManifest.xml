@@ -12,8 +12,18 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
-    <!-- Local HTTP API -->
+    <!-- Voice commands -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
+    <!-- Local HTTP API (Wi-Fi state: to show the phone's address on screen) -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
     <!-- Keep running while the droid is driving around -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -24,7 +34,7 @@
 
     <application
         android:label="DroidLink"
-        android:icon="@android:drawable/stat_sys_data_bluetooth"
+        android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true">
 
         <activity
@@ -39,6 +49,6 @@
         <service
             android:name=".BridgeService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice|camera" />
+            android:foregroundServiceType="connectedDevice|camera|microphone" />
     </application>
 </manifest>

@@ -85,6 +85,10 @@ class HttpServer(
                 write(c.getOutputStream(), response)
             } catch (e: IOException) {
                 // client went away mid-response (normal for streams)
+            } catch (e: Exception) {
+                // Anything else must not escape: an uncaught exception on this
+                // thread would crash the whole app, service included.
+                Log.w(TAG, "error while responding", e)
             }
         }
     }

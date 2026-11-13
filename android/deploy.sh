@@ -25,17 +25,30 @@ fi
 
 echo "== install on $DEV"
 "$ADB" -s "$DEV" install -r app/build/outputs/apk/debug/app-debug.apk >/dev/null
-for p in BLUETOOTH_SCAN BLUETOOTH_CONNECT CAMERA POST_NOTIFICATIONS; do
+for p in BLUETOOTH_SCAN BLUETOOTH_CONNECT CAMERA RECORD_AUDIO POST_NOTIFICATIONS; do
     "$ADB" -s "$DEV" shell pm grant $PKG android.permission.$p || true
 done
 
 echo "== restart"
+"$ADB" -s "$DEV" logcat -b crash -c
 "$ADB" -s "$DEV" shell am force-stop $PKG
 "$ADB" -s "$DEV" shell am start -n $PKG/.MainActivity >/dev/null
+up=0
 for i in $(seq 1 60); do
-    if curl -sf "http://$PHONE_IP:8765/health" >/dev/null; then
-        curl -s "http://$PHONE_IP:8765/health"; echo; exit 0
-    fi
+    if curl -sf "http://$PHONE_IP:8765/health" >/dev/null; then up=1; break; fi
     sleep 0.5
 done
-echo "DroidLink did not come up"; exit 1
+sleep 2   # give the screen a moment to crash, if it's going to
+
+# The service can be healthy while the UI crashes, so check the crash log too.
+CRASH=$("$ADB" -s "$DEV" logcat -d -b crash 2>/dev/null | grep -A 12 "Process: $PKG" || true)
+if [ -n "$CRASH" ]; then
+    echo "!! DroidLink crashed:"; echo "$CRASH" | grep -E "Exception|Caused by|at dev\.droidlink" | head -8
+    exit 1
+fi
+[ $up = 1 ] || { echo "DroidLink did not come up"; exit 1; }
+curl -s "http://$PHONE_IP:8765/health"; echo
+# Android only grants background microphone access to a service started while
+# the app is on screen. After a deploy to a locked phone, voice won't work until
+# someone taps Stop then Start in the app.
+echo "note: for voice, tap Stop/Start in DroidLink on the phone (mic needs a start from the screen)"
