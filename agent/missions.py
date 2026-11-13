@@ -29,14 +29,22 @@ a droid workshop. You are brave, curious, loyal and a little cheeky. Like the as
 droids in Star Wars, you talk in beeps, whistles and chirps. Keep everything kid-friendly, \
 and keep it short."""
 
+# Body language that can go with a spoken line (small moves only: no spinning off
+# mid-conversation). "none" is fine most of the time.
+REACTIONS = ["none", "glance", "look_around", "double_take", "shake", "nod", "wiggle", "surprised", "sad"]
+REACTION_HINT = ("move: optional body language to go with it: nod (yes/agree), shake (no), "
+                 "wiggle (happy/excited), double_take or surprised (surprise), sad, glance or "
+                 "look_around (curious), or none.")
+
 SAY_SCHEMA = {
     "type": "object",
     "properties": {
         "mood": {"type": "string", "enum": MOODS},
         "beeps": {"type": "string"},
         "translation": {"type": "string"},
+        "move": {"type": "string", "enum": REACTIONS},
     },
-    "required": ["mood", "beeps", "translation"],
+    "required": ["mood", "beeps", "translation", "move"],
     "additionalProperties": False,
 }
 
@@ -64,6 +72,11 @@ _END = r"(?:\s+(?:please|now|for me|buddy))*\s*$"
 # Common spoken commands, matched directly (reliable and instant). Anything else
 # is left to the model to interpret. Each gives (mission, target).
 COMMANDS = [
+    (re.compile(r"\b(dance|boogie|bust a move)\b", re.I), ("gesture", "dance")),
+    (re.compile(r"\b(spin|twirl)\b", re.I), ("gesture", "happy_spin")),
+    (re.compile(r"\b(shake your head|say no)\b", re.I), ("gesture", "shake")),
+    (re.compile(r"\b(nod|say yes)\b", re.I), ("gesture", "nod")),
+    (re.compile(r"\b(wiggle|shimmy)\b", re.I), ("gesture", "wiggle")),
     (re.compile(r"\bfollow (me|us)\b", re.I), ("follow_target", "person")),
     (re.compile(r"\b(come here|come to me|come over|over here)\b", re.I), ("approach_target", "person")),
     (re.compile(r"\blook around\b", re.I), ("look_around", None)),
@@ -124,6 +137,51 @@ class Droid:
         self.calls: queue.Queue[str] = queue.Queue()   # "HDO, ..." heard in the background
         if listening:
             self._start_wake_word()
+        self.personality = True              # random head glances while active
+        threading.Thread(target=self._fidget, daemon=True).start()
+
+    # --- personality
+
+    def post(self, who: str, text: str) -> None:
+        """Show a line in the browser control panel's log (best effort)."""
+        try:
+            self.bridge.log(who, text)
+        except Exception:
+            pass
+
+    def manual(self) -> bool:
+        """Is someone driving from the control panel right now?"""
+        try:
+            return bool(self.bridge.agent_status().get("manual"))
+        except Exception:
+            return False
+
+    def gesture(self, name: str) -> str:
+        """Perform a canned move (best effort: never breaks a mission)."""
+        try:
+            r = self.bridge.gesture(name)
+            print(f"   [move: {name} -> {r.get('result')}]")
+            return f"did a {name.replace('_', ' ')}"
+        except Unavailable as e:
+            if "called" in str(e) or "override" in str(e):
+                raise Interrupted() from None
+            return f"couldn't do a {name}: {e}"
+        except Exception as e:
+            return f"couldn't do a {name}: {e}"
+
+    def _fidget(self) -> None:
+        """Every so often glance around with the head, like a curious droid. Head
+        moves don't disturb the camera (it's on the body), so this is safe even
+        mid-mission; skipped while talking or listening."""
+        while True:
+            time.sleep(random.uniform(8, 20))
+            if not self.personality or self._in_conversation or time.time() < self.speaking_until + 2:
+                continue
+            try:
+                if self.bridge.droid_status().get("ready"):
+                    self.bridge.gesture(random.choice(["glance"] * 4 + ["look_around", "double_take"]))
+            except Exception:
+                pass
 
     # --- wake word: "HDO, follow me" works any time
 
@@ -266,7 +324,7 @@ class Droid:
             try:
                 r = self.bridge.turn(degrees, tolerance=12 if quick else 5, attempts=1 if quick else 5)
             except Unavailable as e:
-                if "called" in str(e):
+                if "called" in str(e) or "override" in str(e):
                     raise Interrupted() from None
                 raise
             print(f"   [turn {degrees:+.0f}{' quick' if quick else ''}] turned {r['turned']:+.0f} "
@@ -279,7 +337,7 @@ class Droid:
         try:
             return self.bridge.velocity(left, right, ttl_ms)
         except Unavailable as e:
-            if "called" in str(e):
+            if "called" in str(e) or "override" in str(e):
                 raise Interrupted() from None
             raise
 
@@ -346,6 +404,7 @@ class Droid:
             print(f"\n{self.name}: *{beeps}*  [{translation}]{'' if speak else '  (beeped)'}\n")
         if speak:
             self.dialogue = (self.dialogue + [f"{self.name}: {translation}"])[-10:]
+        self.post(self.name, translation if speak else f"*{beeps}*  ({translation})")
         seconds = 0.0
         if self.voice != "english" or not speak:
             seconds += self.chirp(mood)   # the phone queues audio, so speech plays after the chirp
@@ -375,8 +434,21 @@ class Droid:
                 f"{goal}Situation: {situation}\n\nReact in character with one short line about "
                 "this situation only; don't bring up unrelated things. "
                 f"beeps: {beeps_hint()} translation: what it means in English, at most "
-                "12 words. mood: how you feel.")},
+                "12 words. mood: how you feel. " + REACTION_HINT)},
         ], schema=SAY_SCHEMA, max_tokens=120, temperature=0.8)
+        self.reply(r, speak=speak)
+
+    def reply(self, r: dict, speak: bool = True) -> None:
+        """Say a model-written line, with the body language it picked (if any)."""
+        move = r.get("move", "none")
+        if move != "none" and move == getattr(self, "_last_move", None):
+            move = "glance"                 # small models overuse a favourite; keep it varied
+        self._last_move = move
+        if move and move != "none":
+            try:
+                self.gesture(move)          # head moves run alongside the speech
+            except Interrupted:
+                pass                        # someone called us mid-move; the main loop handles it
         self.utter(r["beeps"], r["translation"], r["mood"], speak=speak)
 
     # --- ears
@@ -398,6 +470,8 @@ class Droid:
                 self.listening = False        # don't keep chirping at people for nothing
         text = r.get("text", "").strip()
         print(f"   [heard: {text!r}]" if text else "   [heard nothing]")
+        if text:
+            self.post("You", f"(said) {text}")
         if text:
             self.dialogue = (self.dialogue + [f"Human: {text}"])[-10:]
         return text
@@ -426,16 +500,18 @@ class Droid:
                         "sleep, set action to stop; otherwise set action to none and target to ''. "
                         "You may ask a short follow-up question. "
                         f"beeps: {beeps_hint()} translation: what you say in English, at most 20 "
-                        "words. mood: how you feel.")},
+                        "words. mood: how you feel. " + REACTION_HINT)},
                 ], schema={**SAY_SCHEMA,
                            "properties": {**SAY_SCHEMA["properties"],
                                           "action": {"type": "string", "enum": options},
                                           "target": {"type": "string"}},
                            "required": SAY_SCHEMA["required"] + ["action", "target"]},
-                    max_tokens=160, temperature=0.7)
+                    max_tokens=180, temperature=0.7)
                 if not self.requested and r["action"] != "none":
                     self.request(r["action"], r["target"].strip() or None)
-                self.utter(r["beeps"], r["translation"], r["mood"])
+                if r["action"] != "none":
+                    r["move"] = "none"              # the requested mission will do the moving
+                self.reply(r)
                 if self.requested or not r["translation"].rstrip().endswith("?"):
                     return
                 heard = self.listen(7)
@@ -595,12 +671,14 @@ def find_target(d: Droid, target: str, announce: bool = True) -> str:
         d.goal = f"find the {target}"
     box = _search(d, target)
     if box is None:
+        d.gesture("shake")
         if announce:
             d.say(f"You looked all the way around but couldn't find the {target}.", speak=True)
         return f"couldn't find the {target} anywhere around"
     d.chirp("excited")
     _aim(d, target, box)
     d.remember(target)
+    d.gesture("double_take")
     if announce:
         d.say(f"You found the {target} and you're now facing it.", speak=True)
     return f"found the {target} and turned to face it"
@@ -630,6 +708,9 @@ def approach_target(d: Droid, target: str, follow: bool = False, max_s: float = 
     result = _drive_tracking(d, target, box, jpeg, frame, follow, max_s)
     if result.startswith("reached"):
         d.remember(target)
+        d.gesture("wiggle")
+    elif result.startswith("lost"):
+        d.gesture("sad")
         if announce:
             d.say(f"You rolled right up to the {target}.", speak=True)
     return result
@@ -655,7 +736,7 @@ def greet_human(d: Droid, target: str | None) -> str:
     result = approach_target(d, target or "person")
     if not result.startswith("reached"):
         return result + "; couldn't greet anyone"
-    d.wiggle()
+    d.gesture("dance")
     d.say("You rolled up to a human. Greet them warmly!", speak=True)
     return "greeted a human"
 
@@ -703,8 +784,14 @@ def custom_mission(d: Droid, target: str | None) -> str:
     return run_goal(d, target)
 
 
+def gesture_mission(d: Droid, target: str | None) -> str:
+    return d.gesture(target or "dance")
+
+
 # name -> (function, description for the model)
 MISSIONS = {
+    "gesture": (gesture_mission, "Do a fun move. target: dance, happy_spin, wiggle, nod, shake, "
+                "look_around, double_take, sad or surprised."),
     "custom_mission": (custom_mission, "Anything else, especially requests with several steps "
                        "(e.g. 'check if the dog is asleep and come tell me'). Put the whole "
                        "request in target."),

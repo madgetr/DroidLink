@@ -87,9 +87,19 @@ class DroidBridge:
         body, _ = self._get("/droid/connect")
         return json.loads(body)
 
+    def droid_status(self) -> dict:
+        body, _ = self._get("/droid/status")
+        return json.loads(body)
+
     def droid_disconnect(self) -> dict:
         """Release the droid so its handheld remote works again."""
         body, _ = self._get("/droid/disconnect")
+        return json.loads(body)
+
+    def gesture(self, name: str) -> dict:
+        """A canned move: glance, look_around, shake, double_take (head only, run in the
+        background), or wiggle, nod, happy_spin, dance, sad, surprised (whole body)."""
+        body, _ = self._get(f"/control/gesture?name={name}")
         return json.loads(body)
 
     def stop(self) -> dict:
@@ -130,6 +140,15 @@ class DroidBridge:
         if box is not None:
             q.update(x1=f"{box.x1:.3f}", y1=f"{box.y1:.3f}", x2=f"{box.x2:.3f}", y2=f"{box.y2:.3f}")
         self._get("/camera/overlay?" + urllib.parse.urlencode(q))
+
+    def log(self, who: str, text: str) -> None:
+        """Add a line to the control panel's conversation log."""
+        self._get("/agent/log?" + urllib.parse.urlencode({"who": who, "add": text}))
+
+    def agent_status(self) -> dict:
+        """{manual: someone is driving from the control panel, droid: connected, ...}"""
+        body, _ = self._get("/agent/status")
+        return json.loads(body)
 
     def settings(self) -> dict:
         """The droid's saved settings (name, voice) from the phone app."""

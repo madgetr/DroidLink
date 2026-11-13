@@ -38,6 +38,8 @@ SKILLS = {
             "confirmed with your other skills.", "what to say"),
     "ask": ("Ask the humans a question out loud and hear their answer.", "the question"),
     "wait": ("Wait a few seconds.", "seconds, e.g. '5'"),
+    "gesture": ("Do a fun move to show how you feel.",
+                "one of: dance, happy_spin, wiggle, nod, shake, look_around, sad, surprised"),
     "done": ("The mission is finished, or impossible. The argument is what you say to the "
              "human: the actual answer or result, e.g. 'Yes, the dog is fast asleep!'",
              "your answer for the human"),
@@ -58,7 +60,7 @@ Steps:
 """
 
 MAX_STEPS = 15
-MOVES = {"turn", "drive", "face", "find", "go_to", "follow", "scan"}   # skills that change the view
+MOVES = {"turn", "drive", "face", "find", "go_to", "follow", "scan", "gesture"}   # skills that change the view
 
 
 class Mission:
@@ -220,6 +222,9 @@ class Mission:
             d.utter(random.choice(["bweep?", "dwoo?", "tweet?"]), question, "curious", listen=False)
             heard = d.listen(8)
             return f'the human answered: "{heard}"' if heard else "nobody answered"
+        if skill == "gesture":
+            name = re.sub(r"[^a-z_]", "", arg.lower().replace(" ", "_")) or "wiggle"
+            return d.gesture(name)
         if skill == "wait":
             s = max(1, min(30, _number(arg, 5)))
             time.sleep(s)

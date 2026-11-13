@@ -90,6 +90,48 @@ class MotionController(
 
     private fun checkHold() {
         if (System.currentTimeMillis() < holdUntil) throw Unavailable("paused: someone called my name")
+        if (manual && !fromUi.get()) throw Unavailable("paused: manual override from the control panel")
+    }
+
+    // --- manual override from the browser control panel. While on, only commands
+    // from the panel move the droid; the agent's are refused (it waits).
+
+    @Volatile var manual = false
+        private set
+
+    /** Marks the current request thread as coming from the control panel. */
+    val fromUi: ThreadLocal<Boolean> = ThreadLocal.withInitial { false }
+
+    fun setManual(on: Boolean): JSONObject {
+        manual = on
+        stop()
+        return JSONObject().put("manual", manual)
+    }
+
+    // --- manual head driving (hold a button = turn; dead-man like velocity mode)
+
+    @Volatile private var headSpeed = 0.0
+    @Volatile private var headDeadline = 0L
+    @Volatile private var headThread: Thread? = null
+
+    fun headVelocity(speed: Double, ttlMs: Long): JSONObject {
+        if (!driver.connected) throw Unavailable("no droid connected")
+        if (speed != 0.0) checkHold()
+        headSpeed = speed.coerceIn(-1.0, 1.0) * settings.headSign
+        headDeadline = System.currentTimeMillis() + ttlMs.coerceIn(50, 1_000)
+        if (headThread?.isAlive != true) {
+            headThread = kotlin.concurrent.thread(name = "head-velocity") {
+                try {
+                    while (System.currentTimeMillis() < headDeadline) {
+                        driver.head(headSpeed); Thread.sleep(20)
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { driver.head(0.0) } catch (_: Exception) {}
+                }
+            }
+        }
+        return JSONObject().put("head", headSpeed)
     }
 
     // --- velocity mode: the laptop streams wheel speeds for continuous driving.
@@ -109,7 +151,9 @@ class MotionController(
         velDeadline = System.currentTimeMillis() + ttlMs.coerceIn(50, 2_000)
         if (velThread?.isAlive != true) {
             velEnded = null
+            val ui = fromUi.get()             // carry "from the control panel" into the worker thread
             velThread = kotlin.concurrent.thread(name = "velocity") {
+                fromUi.set(ui)
                 velEnded = try {
                     move("velocity", VELOCITY_BUMP) { guard ->
                         var reason = "released"
@@ -266,6 +310,10 @@ class MotionController(
             .put("attempts", attempts)
             .put("result", reason)
     }
+
+    /** Run a canned body move (see Gestures) with the usual safety guard. */
+    fun gesture(name: String, body: (guard: () -> String?) -> String): JSONObject =
+        move("gesture", TURN_BUMP) { guard -> JSONObject().put("gesture", name).put("result", body(guard)) }
 
     /** Point the head straight ahead again. */
     fun headCenter(): JSONObject =

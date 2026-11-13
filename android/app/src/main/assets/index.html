@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DroidLink</title>
+<style>
+  :root {
+    --bg: #0f141c; --panel: #18202c; --line: #2a3546; --text: #e8edf4; --muted: #8a98ad;
+    --accent: #3b8cff; --ok: #3ccf74; --warn: #f2b33d; --bad: #f05252;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+           padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 20px; margin: 0 8px 0 0; }
+  .pill { padding: 3px 10px; border-radius: 999px; font-size: 13px; background: var(--panel);
+          border: 1px solid var(--line); color: var(--muted); }
+  .pill.on { color: #071; background: var(--ok); border-color: var(--ok); }
+  .pill.warn { color: #3a2600; background: var(--warn); border-color: var(--warn); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; padding: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+  .card h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+             margin: 0 0 10px; }
+  #cam { width: 100%; max-height: 72vh; object-fit: contain; background: #000; border-radius: 8px; display: block; }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  button { font: inherit; color: var(--text); background: #223046; border: 1px solid var(--line);
+           border-radius: 10px; padding: 10px 12px; cursor: pointer; touch-action: none; user-select: none; }
+  button:hover { border-color: var(--accent); }
+  button.active, button:active { background: var(--accent); border-color: var(--accent); }
+  #stop { width: 100%; background: var(--bad); border-color: var(--bad); font-weight: 700; font-size: 18px; padding: 14px; }
+  #control { width: 100%; }
+  #control.on { background: var(--warn); border-color: var(--warn); color: #2b1d00; font-weight: 600; }
+  .pad { display: grid; grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(3, 64px);
+         gap: 6px; justify-content: center; margin: 12px 0; }
+  .pad button { font-size: 22px; padding: 0; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .row > * { flex: 1 1 auto; }
+  label.slider { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  label.slider input { flex: 1; }
+  .moves { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .moves button { padding: 8px 6px; font-size: 13px; }
+  #log { height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+         padding: 4px; margin-bottom: 8px; }
+  .msg { padding: 6px 10px; border-radius: 10px; max-width: 90%; word-wrap: break-word; }
+  .msg .who { font-size: 11px; color: var(--muted); }
+  .msg.you { align-self: flex-end; background: #24406b; }
+  .msg.droid { align-self: flex-start; background: #233026; }
+  .msg.sys { align-self: center; background: transparent; color: var(--muted); font-size: 13px; }
+  #say { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid var(--line);
+         background: #0f1520; color: var(--text); font: inherit; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="name">DroidLink</h1>
+  <span class="pill" id="p-droid">droid: ?</span>
+  <span class="pill" id="p-agent">agent: ?</span>
+  <span class="pill" id="p-manual">auto</span>
+</header>
+
+<main>
+  <div class="col">
+    <div class="card">
+      <img id="cam" alt="camera" src="/camera/stream?camera=2&fps=8&width=480">
+    </div>
+    <div class="card">
+      <h2>Talk</h2>
+      <div id="log"></div>
+      <input id="say" placeholder="Type a message…  (Enter = tell the droid)" autocomplete="off">
+      <div class="row" style="margin-top:8px">
+        <button id="tell">Tell the droid</button>
+        <button id="speak">Say it out loud</button>
+      </div>
+      <div class="hint">"Tell" goes to the agent like talking to it by name (it may start a mission).
+        "Say it out loud" makes the droid speak your words in its voice.</div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <button id="stop">■ STOP</button>
+      <div style="height:10px"></div>
+      <button id="control">Take control</button>
+      <div class="hint">While you have control, the agent pauses. Driving takes control automatically.</div>
+      <div class="pad">
+        <span></span><button data-dir="up">▲</button><span></span>
+        <button data-dir="left">◀</button><button id="padstop">■</button><button data-dir="right">▶</button>
+        <span></span><button data-dir="down">▼</button><span></span>
+      </div>
+      <label class="slider">Speed <input id="speed" type="range" min="0.45" max="1" step="0.05" value="0.6">
+        <span id="speedv">0.60</span></label>
+      <div class="row" style="margin-top:10px">
+        <button data-head="-1">⟲ Head left</button>
+        <button data-head="1">Head right ⟳</button>
+      </div>
+      <div class="hint">Keys: arrows / WASD drive, Q / E head, Space stops.</div>
+    </div>
+
+    <div class="card">
+      <h2>Moves</h2>
+      <div class="moves" id="moves"></div>
+    </div>
+
+    <div class="card" id="connectcard" hidden>
+      <h2>Droid</h2>
+      <button id="connect" style="width:100%">Connect to the droid</button>
+      <div class="hint">The droid's handheld remote doesn't work while the phone is connected.</div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const get = (path) => fetch(path).then(r => r.json()).catch(() => ({}));
+let manual = false;
+
+// ---------------------------------------------------------------- driving
+const held = new Set();      // directions currently held
+let headDir = 0;
+let timer = null;
+const speed = () => parseFloat($("speed").value);
+$("speed").oninput = () => $("speedv").textContent = speed().toFixed(2);
+
+function wheelSpeeds() {
+  const f = (held.has("up") ? 1 : 0) - (held.has("down") ? 1 : 0);
+  const t = (held.has("right") ? 1 : 0) - (held.has("left") ? 1 : 0);
+  const s = speed();
+  if (f === 0) return [t * s * 0.85, -t * s * 0.85];          // turn in place
+  const l = f * s + t * s * 0.5, r = f * s - t * s * 0.5;      // drive with a curve
+  const k = Math.max(1, Math.abs(l), Math.abs(r));
+  return [l / k, r / k];
+}
+
+function tick() {
+  // Commands expire on the phone after a moment (dead-man switch), so we keep
+  // re-sending while a button is held; letting go = it stops.
+  if (held.size) {
+    const [l, r] = wheelSpeeds();
+    fetch(`/control/velocity?left=${l.toFixed(2)}&right=${r.toFixed(2)}&ttl_ms=400&src=ui`);
+  }
+  if (headDir) fetch(`/control/head_velocity?speed=${(headDir * 0.55).toFixed(2)}&ttl_ms=300&src=ui`);
+  if (!held.size && !headDir) { clearInterval(timer); timer = null; }
+}
+
+async function ensureControl() { if (!manual) await setManual(true); }
+
+async function press(dir) {
+  await ensureControl();
+  held.add(dir);
+  if (!timer) { timer = setInterval(tick, 150); }
+  tick();
+}
+function release(dir) {
+  if (!held.delete(dir)) return;
+  if (!held.size) fetch(`/control/velocity?left=0&right=0&ttl_ms=100&src=ui`);
+}
+async function headPress(d) {
+  await ensureControl();
+  headDir = d;
+  if (!timer) timer = setInterval(tick, 150);
+  tick();
+}
+function headRelease() {
+  if (!headDir) return;
+  headDir = 0;
+  fetch(`/control/head_velocity?speed=0&ttl_ms=50&src=ui`);
+}
+function stopAll() {
+  held.clear(); headDir = 0;
+  fetch(`/control/stop?src=ui`);
+}
+
+function holdButton(el, down, up) {
+  el.addEventListener("pointerdown", (e) => { e.preventDefault(); el.classList.add("active"); down(); });
+  for (const ev of ["pointerup", "pointerleave", "pointercancel"])
+    el.addEventListener(ev, () => { el.classList.remove("active"); up(); });
+}
+document.querySelectorAll("[data-dir]").forEach(b => holdButton(b, () => press(b.dataset.dir), () => release(b.dataset.dir)));
+document.querySelectorAll("[data-head]").forEach(b => holdButton(b, () => headPress(+b.dataset.head), headRelease));
+$("stop").onclick = stopAll;
+$("padstop").onclick = stopAll;
+
+const KEYS = { ArrowUp: "up", w: "up", ArrowDown: "down", s: "down", ArrowLeft: "left", a: "left", ArrowRight: "right", d: "right" };
+document.addEventListener("keydown", (e) => {
+  if (e.target === $("say") || e.repeat) return;
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (KEYS[k]) { e.preventDefault(); press(KEYS[k]); }
+  else if (k === "q") headPress(-1);
+  else if (k === "e") headPress(1);
+  else if (k === " ") { e.preventDefault(); stopAll(); }
+});
+document.addEventListener("keyup", (e) => {
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (KEYS[k]) release(KEYS[k]);
+  else if (k === "q" || k === "e") headRelease();
+});
+window.addEventListener("blur", () => { held.clear(); headRelease(); });
+
+// ------------------------------------------------------------ control mode
+async function setManual(on) {
+  const r = await get(`/ui/manual?on=${on ? 1 : 0}&src=ui`);
+  manual = !!r.manual;
+  renderManual();
+}
+function renderManual() {
+  $("control").textContent = manual ? "Give control back to the agent" : "Take control";
+  $("control").classList.toggle("on", manual);
+  $("p-manual").textContent = manual ? "manual control" : "auto";
+  $("p-manual").className = "pill" + (manual ? " warn" : "");
+}
+$("control").onclick = () => setManual(!manual);
+
+// -------------------------------------------------------------------- moves
+get("/control/gesture").then(r => {
+  for (const g of (r.gestures || [])) {
+    const b = document.createElement("button");
+    b.textContent = g.name.replace(/_/g, " ");
+    b.onclick = () => fetch(`/control/gesture?name=${g.name}&src=ui`);
+    $("moves").appendChild(b);
+  }
+});
+
+// --------------------------------------------------------------------- talk
+let logNext = 0;
+function addMsg(who, text) {
+  const div = document.createElement("div");
+  const cls = who === "You" ? "you" : (who === "panel" || who === "agent" ? "sys" : "droid");
+  div.className = "msg " + cls;
+  if (cls === "sys") div.textContent = text;
+  else { div.innerHTML = `<div class="who"></div><div class="t"></div>`;
+         div.querySelector(".who").textContent = who; div.querySelector(".t").textContent = text; }
+  const log = $("log");
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  log.appendChild(div);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+async function pollLog() {
+  const r = await get(`/agent/log?since=${logNext}`);
+  for (const it of (r.items || [])) addMsg(it.who, it.text);
+  if (r.next !== undefined) logNext = r.next;
+}
+function tell() {
+  const t = $("say").value.trim(); if (!t) return;
+  fetch(`/agent/say?text=${encodeURIComponent(t)}`); $("say").value = "";
+}
+function speakIt() {
+  const t = $("say").value.trim(); if (!t) return;
+  fetch(`/sound/speak?text=${encodeURIComponent(t)}`);
+  addMsg("panel", `(the droid says) ${t}`); $("say").value = "";
+}
+$("tell").onclick = tell;
+$("speak").onclick = speakIt;
+$("say").addEventListener("keydown", (e) => { if (e.key === "Enter") tell(); });
+
+// ------------------------------------------------------------------- status
+async function pollStatus() {
+  const s = await get("/agent/status");
+  if (s.name) { $("name").textContent = s.name; document.title = s.name + " · DroidLink"; }
+  $("p-droid").textContent = s.droid ? "droid connected" : "droid not connected";
+  $("p-droid").className = "pill" + (s.droid ? " on" : "");
+  $("p-agent").textContent = s.agent_active ? "agent running" : "agent idle";
+  $("p-agent").className = "pill" + (s.agent_active ? " on" : "");
+  $("connectcard").hidden = !!s.droid;
+  if (s.manual !== undefined && s.manual !== manual) { manual = s.manual; renderManual(); }
+}
+$("connect").onclick = async () => {
+  $("connect").textContent = "Connecting…";
+  const r = await get("/droid/connect");
+  $("connect").textContent = r.ready ? "Connected" : ("Couldn't connect: " + (r.detail || "?"));
+  setTimeout(() => $("connect").textContent = "Connect to the droid", 4000);
+};
+
+setInterval(pollLog, 1000);
+setInterval(pollStatus, 1500);
+pollLog(); pollStatus(); renderManual();
+</script>
+</body>
+</html>

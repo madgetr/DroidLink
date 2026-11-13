@@ -111,6 +111,16 @@ def run(args) -> None:
     n = 0
     try:
         while n < args.missions:
+            # Someone driving from the control panel? Wait until they give control back.
+            if d.manual():
+                print("\n[manual control from the control panel: waiting]")
+                d.post("agent", "Paused: you have manual control")
+                while d.manual():
+                    time.sleep(1)
+                    while not d.calls.empty():          # still answer messages meanwhile
+                        d.answer_call(d.calls.get())
+                d.post("agent", "Agent resumed")
+                print("[control given back: resuming]")
             # Someone called us by name? Answer first (may request a mission or stop).
             while not d.calls.empty() and d.requested != "stop":
                 d.answer_call(d.calls.get())
@@ -123,7 +133,7 @@ def run(args) -> None:
             try:
                 outcome, mission = run_one(d, args, history)
             except Interrupted:
-                print("   [interrupted: someone called my name]")
+                print("   [interrupted: called by name, or manual control]")
                 n -= 1          # doesn't count; answer them and carry on
                 continue
             history.append(Memory(mission, outcome, time.time()))
@@ -151,6 +161,7 @@ def run_one(d: Droid, args, history: list[Memory]) -> tuple[str, str]:
         choice = pick_mission(d, p, history)
     target = (choice.get("target") or "").strip() or None
     print(f"\n>>> {choice['mission'].upper()}{f' [{target}]' if target else ''}: {choice['reason']}")
+    d.post("agent", f"Mission: {choice['mission'].replace('_', ' ')}{f' ({target})' if target else ''}")
     if "beeps" in choice:
         # Announcing our own plan is internal monologue: beep it, don't say it.
         d.utter(choice["beeps"], choice["translation"], choice["mood"], speak=False)
@@ -165,6 +176,7 @@ def run_one(d: Droid, args, history: list[Memory]) -> tuple[str, str]:
         outcome = f"mission failed: {e}"
         print(f"   [error] {e}")
     print(f"<<< {choice['mission']}: {outcome}")
+    d.post("agent", f"Done: {outcome}")
     return outcome, choice["mission"]
 
 

@@ -225,6 +225,15 @@ class VoiceInput(private val ctx: Context) {
     fun wakeStatus(): JSONObject = JSONObject().put("wake", wakeOn).put("names", JSONArray(wakeNames))
         .put("recently_heard", synchronized(recent) { JSONArray(recent.toList()) })
 
+    /** A message typed in the control panel: delivered to the agent like "HDO, <text>". */
+    fun pushTyped(text: String): JSONObject = synchronized(events) {
+        val ev = JSONObject().put("seq", eventSeq++).put("ts", now())
+            .put("text", text).put("command", text).put("typed", true)
+        events.addLast(ev)
+        while (events.size > 50) events.removeFirst()
+        ev
+    }
+
     fun events(since: Long): JSONObject = synchronized(events) {
         JSONObject().put("next", eventSeq)
             .put("items", JSONArray(events.filter { it.getLong("seq") >= since }))

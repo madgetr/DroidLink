@@ -28,6 +28,8 @@ class BridgeService : Service() {
     private lateinit var sound: SoundHub
     private lateinit var droid: DroidDepotDriver
     private lateinit var ears: VoiceInput
+    private lateinit var gestures: Gestures
+    private val log = AgentLog()
     private val overlay = Overlay()
     private lateinit var settings: Settings
     private var server: HttpServer? = null
@@ -43,6 +45,9 @@ class BridgeService : Service() {
         droid = DroidDepotDriver(ble, settings)
         motion = MotionController(sensors, droid, settings)
         sound = SoundHub(this)
+        gestures = Gestures({ droid }, motion, settings) { mood ->
+            try { sound.chirp(mood, null) } catch (_: Exception) {}
+        }
         ears = VoiceInput(this)
         ears.isSpeaking = { sound.isPlaying() }
         ears.spokeSince = { sound.playedSince(it) }
@@ -50,6 +55,8 @@ class BridgeService : Service() {
         // straight away. The laptop then interrupts its mission and takes over.
         ears.onWake = { command ->
             motion.hold(2_000)
+            log.add("You", "(said) ${settings.name}${if (command.isBlank()) "" else ", $command"}", false)
+            try { gestures.perform("glance") } catch (_: Exception) {}   // "hm? who said that?"
             try {
                 if (command.isBlank()) {
                     sound.chirp("curious", null)
@@ -127,8 +134,34 @@ class BridgeService : Service() {
         fun int(key: String, default: Int) = p[key]?.toIntOrNull() ?: default
         fun flag(key: String, default: Boolean) = p[key]?.let { it == "1" || it == "true" } ?: default
 
+        // Commands from the browser control panel carry src=ui; they still work
+        // during a manual override, while the agent's are refused.
+        motion.fromUi.set(p["src"] == "ui")
+
         return when {
-            path == "/" || path == "/health" -> Json(JSONObject()
+            // --- browser control panel
+            path == "/" || path == "/ui" -> Bytes("text/html; charset=utf-8",
+                assets.open("index.html").use { it.readBytes() })
+            path == "/ui/manual" -> Json(motion.setManual(flag("on", true)).also {
+                log.add("panel", if (motion.manual) "You took manual control" else "You gave control back", false)
+            })
+            path == "/agent/status" -> Json(JSONObject()
+                .put("manual", motion.manual)
+                .put("agent_active", System.currentTimeMillis() - log.lastAgentPost < 20_000)
+                .put("droid", droid.connected)
+                .put("name", settings.name))
+            path == "/agent/say" -> {                    // typed in the panel: to the agent
+                val text = need("text")
+                log.add("You", text, false)
+                Json(ears.pushTyped(text))
+            }
+            path == "/agent/log" -> Json(
+                p["add"]?.let { log.add(p["who"] ?: settings.name, it, true) }
+                    ?: log.since(p["since"]?.toLongOrNull() ?: 0))
+            path == "/control/head_velocity" -> Json(motion.headVelocity(
+                num("speed"), p["ttl_ms"]?.toLongOrNull() ?: 300))
+
+            path == "/health" -> Json(JSONObject()
                 .put("status", "ok")
                 .put("app", "droidlink")
                 .put("version", BuildConfig.VERSION_NAME)
@@ -186,6 +219,9 @@ class BridgeService : Service() {
             path == "/control/spin_test" -> Json(motion.spinTest(
                 num("power").coerceIn(-1.0, 1.0), p["seconds"]?.toDoubleOrNull() ?: 0.6,
                 head = p["part"] == "head"))
+            path == "/control/gesture" -> Json(
+                p["name"]?.takeIf { it.isNotEmpty() }?.let { gestures.perform(it) }
+                    ?: JSONObject().put("gestures", gestures.list()))
             path == "/control/head/calibrate" -> Json(motion.headCalibrate())
             path == "/control/head" -> Json(motion.headTurn(
                 motion.headClamp(num("degrees").coerceIn(-180.0, 180.0)),

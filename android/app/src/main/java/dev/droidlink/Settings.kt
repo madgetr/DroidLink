@@ -68,6 +68,11 @@ class Settings(ctx: Context) {
     var headCoastS: Float
         get() = prefs.getFloat("head_coast_s", 0.25f)
         set(v) = prefs.edit().putFloat("head_coast_s", v.coerceIn(0f, 1f)).commit().let {}
+    /** Head power for canned gestures (the dome without the phone on it). */
+    var headGesturePower: Float
+        get() = prefs.getFloat("head_gesture_power", 0.55f)
+        set(v) = prefs.edit().putFloat("head_gesture_power", v.coerceIn(0.1f, 1f)).commit().let {}
+
     /** Half the head's range of motion, degrees (0 = not calibrated yet). */
     var headHalfRange: Float
         get() = prefs.getFloat("head_half_range", 0f)
