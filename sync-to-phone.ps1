@@ -11,7 +11,7 @@ Write-Host "Packaging files..." -ForegroundColor Cyan
 if (Test-Path $TarFile) { Remove-Item $TarFile -Force }
 
 # Use tar to create a clean archive with forward-slash paths
-tar --exclude='.git' --exclude='venv' --exclude='__pycache__' --exclude='.vscode' --exclude='sync-to-phone.ps1' -czf $TarFile .
+tar --exclude='.git' --exclude='venv' --exclude='__pycache__' --exclude='.vscode' --exclude='sync-to-phone.ps1' --exclude='agent' -czf $TarFile .
 
 Write-Host "Uploading archive to phone..." -ForegroundColor Cyan
 scp -q $TarFile "$RemoteHost`:~/bot_sync.tar.gz"
