@@ -14,9 +14,11 @@ import threading
 import time
 from pathlib import Path
 
+from agent import detector as detection
 from agent import llm
+from agent.detector import RADAR_NAME, coco_class
 from agent.bridge import DroidBridge, Unavailable
-from agent.perception import Perception, floor_clear, perceive
+from agent.perception import DISTANCE_CM, SPOT_OFFSET, Perception, floor_clear, perceive
 from agent.tools import DroidTools
 from agent.tracking import Tracker, decode
 from agent.vision import Box, locate, locate_with_path
@@ -59,6 +61,7 @@ def beeps_hint() -> str:
 
 
 DRIVE_CM = 40          # longest single drive while things are experimental
+BACKUP_CM = 20         # how far to reverse when stuck or asked to back up
 HFOV = 90.0            # ultrawide's horizontal field of view in portrait (measured ~90, degrees)
 CENTER_TOL = 0.08      # target counts as centred within this fraction of the frame
 
@@ -77,6 +80,7 @@ COMMANDS = [
     (re.compile(r"\b(shake your head|say no)\b", re.I), ("gesture", "shake")),
     (re.compile(r"\b(nod|say yes)\b", re.I), ("gesture", "nod")),
     (re.compile(r"\b(wiggle|shimmy)\b", re.I), ("gesture", "wiggle")),
+    (re.compile(r"\b(back up|back off|backwards|reverse|go back|move back)\b(?!\s+to\b)", re.I), ("back_up", None)),
     (re.compile(r"\bfollow (me|us)\b", re.I), ("follow_target", "person")),
     (re.compile(r"\b(come here|come to me|come over|over here)\b", re.I), ("approach_target", "person")),
     (re.compile(r"\blook around\b", re.I), ("look_around", None)),
@@ -126,7 +130,8 @@ class Droid:
         self.last: Perception | None = None
         self.torch_on = False   # the flashlight mode itself is a setting in the phone app
         self.goal = ""          # what we're trying to do right now, keeps chatter on topic
-        self.memory: dict[str, float] = {}   # thing -> gyro yaw where we last faced it
+        # Memory of where things are lives on the phone (the radar): it fades with time
+        # and with distance driven. See remember() / recall() / radar_summary().
         # Conversation
         self.listening = listening           # use the phone's microphone at all
         self.dialogue: list[str] = []        # recent lines, "Human: ..." / "HDO: ..."
@@ -139,6 +144,12 @@ class Droid:
             self._start_wake_word()
         self.personality = True              # random head glances while active
         threading.Thread(target=self._fidget, daemon=True).start()
+        # Fast object detector (CPU): finds/tracks common things and keeps the radar
+        # filled in the background, so the vision model isn't asked for those
+        self.det = detection.shared()
+        self.radar_on = self.det is not None
+        if self.det:
+            threading.Thread(target=self._radar_loop, daemon=True).start()
 
     # --- personality
 
@@ -183,6 +194,44 @@ class Droid:
             except Exception:
                 pass
 
+    # --- radar: the detector watches all the time
+
+    def can_detect(self, target: str) -> bool:
+        """Can the fast detector find this (one of its 80 everyday things)?"""
+        return self.det is not None and coco_class(target) is not None
+
+    def _radar_loop(self) -> None:
+        """A couple of times a second: what's in view goes on the radar, with the
+        direction measured from the photo's own gyro heading."""
+        last_yaw = None
+        while self.radar_on:
+            t = time.time()
+            try:
+                snap = self.bridge.snapshot(camera=self.camera, width=640)
+                seen = []
+                for d in self.det.detect(snap.jpeg):
+                    if d.conf < 0.5:
+                        continue
+                    name = RADAR_NAME.get(d.label, d.label)
+                    offset = d.box.cx - 0.5
+                    r = self.bridge.memory_see(
+                        name, offset=None if snap.yaw is not None else offset,
+                        bearing=snap.yaw + offset * HFOV if snap.yaw is not None else None,
+                        distance_cm=estimate_distance(d.box, d.label),
+                        confidence=min(0.95, d.conf + 0.2), hfov=HFOV, detector=True)
+                    seen.append(r["id"])
+                # Things that should be in view but aren't: probably gone. Not while
+                # turning: a blurry frame from a spin misses things that are still there.
+                steady = snap.yaw is not None and last_yaw is not None and abs(snap.yaw - last_yaw) < 8
+                last_yaw = snap.yaw
+                if steady:
+                    gone = self.bridge.memory_missed(snap.yaw, seen, HFOV).get("gone")
+                    if gone:
+                        print(f"   [radar: {', '.join(gone)} gone]")
+            except Exception:
+                pass
+            time.sleep(max(0.1, RADAR_PERIOD_S - (time.time() - t)))
+
     # --- wake word: "HDO, follow me" works any time
 
     def _start_wake_word(self) -> None:
@@ -207,6 +256,7 @@ class Droid:
             time.sleep(0.4)
 
     def stop_listening(self) -> None:
+        self.radar_on = False
         try:
             self.bridge.wake(False)
         except Exception:
@@ -247,27 +297,71 @@ class Droid:
             print(f"   [headlamp {'on' if snap.torch else 'off'}]")
         return snap
 
-    def look(self) -> Perception:
-        """Photo + general description (people, pets, floor, interesting things)."""
+    def look(self, things: bool = False) -> Perception:
+        """Photo + general description (people, pets, floor, interesting things).
+        [things]: also list unusual objects for the radar (a few seconds slower)."""
         t = time.time()
         snap = self.snap()
-        p = Perception(**perceive(snap.jpeg), heading=snap.azimuth, seconds=time.time() - t)
+        dets = self.det.detect(snap.jpeg) if self.det else None
+        p = Perception(**perceive(snap.jpeg, dets, things=things or dets is None),
+                       heading=snap.azimuth, seconds=time.time() - t)
         heading = f"{p.heading:.0f}" if p.heading is not None else "?"
         print(f"   [look @ {heading} deg, {p.seconds:.1f}s] {p.summary()}")
         self.last = p
+        self._map_perception(p, dets)
         return p
 
-    def find(self, target: str) -> Box | None:
-        """Photo + precise location of [target] in it (None if not visible)."""
+    def _map_perception(self, p: Perception, dets=None) -> None:
+        """Everything the look saw goes on the radar. Detector boxes are precise; the
+        model's answers are rough (thirds of the frame)."""
+        where = {"left": -0.25, "center": 0.0, "right": 0.25}
+        if dets is not None:
+            if not self.radar_on:        # (otherwise the background radar loop maps them)
+                for d in dets:
+                    if d.conf >= 0.45:
+                        self.remember(RADAR_NAME.get(d.label, d.label), d.box.cx - 0.5,
+                                      estimate_distance(d.box, d.label), min(0.95, d.conf + 0.2))
+        elif p.person:
+            self.remember("person", where[p.person_where], DISTANCE_CM.get(p.person_distance), 0.75)
+        if p.pet and dets is None:
+            self.remember(p.pet_kind or "pet", where[p.pet_where], DISTANCE_CM.get(p.pet_distance), 0.75)
+        for t in p.things[:4]:
+            name = (t.get("name") or "").strip().lower()
+            cls = coco_class(name)
+            if cls:                      # "sofa" -> "couch": same name as the detector uses
+                name = RADAR_NAME.get(cls, cls)
+            if name and not name.endswith(("person", "floor", "wall", "walls", "ceiling", "beams")):
+                self.remember(name, SPOT_OFFSET.get(t.get("where"), 0.0),
+                              DISTANCE_CM.get(t.get("distance")), 0.6)
+
+    def find(self, target: str, fast_only: bool = False) -> Box | None:
+        """Photo + precise location of [target] in it (None if not visible).
+        Everyday things: the fast detector first (~0.1 s); the vision model (~1 s)
+        if it misses (unless [fast_only]) or for anything else."""
         t = time.time()
         snap = self.snap()
         self.show(None, "", f"looking for the {target}...", "yellow")
-        box = locate(snap.jpeg, target)
-        print(f"   [find {target}: {box or 'not in view'}, {time.time() - t:.1f}s]")
+        box, how = None, "model"
+        if self.can_detect(target):
+            box, how = self.det.find(snap.jpeg, target), "detector"
+        if box is None and not (fast_only and self.can_detect(target)):
+            if how == "detector":
+                how = "detector missed; model"
+            box = locate(snap.jpeg, target)
+        print(f"   [find {target} ({how}): {box or 'not in view'}, {time.time() - t:.1f}s]")
         if box:
-            self.show(box, target, f"found the {target} (model)", "yellow")
+            self.show(box, target, f"found the {target} ({how})", "yellow")
+            self.remember(target, box.cx - 0.5, estimate_distance(box, target), 0.9)
         else:
             self.show(None, "", f"no {target} in view", "red")
+            m = self.recall_one(target)
+            if m and abs(m["relative_deg"]) < HFOV / 2 - 10 and m["confidence"] > 0.2:
+                # The radar says it should be right here, and it isn't: trust that less
+                try:
+                    self.bridge.memory_doubt(m["thing"], 0.4, m.get("id"))
+                    print(f"   [radar: the {m['thing']} isn't where I remembered]")
+                except Exception:
+                    pass
         return box
 
     def check(self, question: str) -> str:
@@ -282,31 +376,48 @@ class Droid:
         print(f"   [check: {question} -> {r['answer']}]")
         return r["answer"]
 
-    def remember(self, thing: str) -> None:
-        """Note which way we're facing now, as where [thing] is."""
+    def remember(self, thing: str, offset: float = 0.0, distance_cm: float | None = None,
+                 confidence: float = 0.9) -> None:
+        """Put [thing] on the radar: [offset] across the current view (-0.5..0.5)."""
         try:
-            yaw = self.bridge.yaw()
+            self.bridge.memory_see(thing, offset=offset, distance_cm=distance_cm,
+                                   confidence=confidence, hfov=HFOV)
+        except Exception as e:
+            print(f"   [radar: couldn't note the {thing}: {e}]")
+
+    def recall(self) -> list[dict]:
+        """Everything on the radar, most confident first (confidence already faded)."""
+        try:
+            items = self.bridge.memory().get("items", [])
         except Exception:
-            yaw = None
-        if yaw is not None:
-            self.memory[thing] = yaw
-            print(f"   [memory: {thing} is at yaw {yaw:.0f}]")
+            return []
+        return sorted(items, key=lambda m: -m["confidence"])
+
+    def recall_one(self, thing: str) -> dict | None:
+        """The most confident radar memory matching [thing] ('dog' matches 'brown dog')."""
+        thing = thing.lower().strip()
+        for m in self.recall():
+            if m["thing"] in thing or thing in m["thing"]:
+                return m
+        return None
+
+    def radar_summary(self, limit: int = 8) -> str:
+        """The radar in words, for the model."""
+        lines = [describe_memory(m) for m in self.recall() if m["confidence"] >= 0.08][:limit]
+        return "\n".join(lines) or "- (nothing yet)"
 
     def face(self, thing: str) -> str:
-        """Turn back toward where we last saw [thing]."""
-        key = next((k for k in self.memory if k in thing or thing in k), None)
-        if key is None:
-            return f"I don't remember where the {thing} is"
-        try:
-            now = self.bridge.yaw()
-        except Exception:
-            now = None
-        if now is None:
-            return "no gyro heading available"
-        delta = (self.memory[key] - now + 540) % 360 - 180
-        if abs(delta) > 3:
-            self.turn(delta)
-        return f"turned back toward the {key} (where I saw it earlier)"
+        """Turn toward where the radar says [thing] is, if that memory is still trustworthy."""
+        m = self.recall_one(thing)
+        if m is None:
+            return f"I don't remember seeing a {thing}"
+        if m["confidence"] < 0.15:
+            return (f"I saw the {m['thing']} {_ago(m['age_s'])}, but that's too long ago to "
+                    f"trust; look for it instead")
+        if abs(m["relative_deg"]) > 3:
+            self.turn(m["relative_deg"])
+        return (f"turned toward where I last saw the {m['thing']} ({_ago(m['age_s'])}, "
+                f"{_sure(m['confidence'])})")
 
     def show(self, box, label: str, status: str, color: str = "green") -> None:
         """Draw what we're doing on the phone's live stream (best effort, never blocks for long)."""
@@ -361,8 +472,28 @@ class Droid:
             print("   [drive refused: floor ahead not clear]")
             return False
         cm = max(-DRIVE_CM, min(DRIVE_CM, cm))
-        print(f"   [drive {cm:+.0f}cm] " + self.tools.run("drive", {"distance_cm": cm})[0]["text"])
+        text = self.tools.run("drive", {"distance_cm": cm})[0]["text"]
+        print(f"   [drive {cm:+.0f}cm] {text}")
+        if "stuck" in text:          # wheels turning but the view stopped changing
+            self.unstick()
         return True
+
+    def back_up(self, cm: float = None) -> str:
+        """Reverse straight back. No floor check: the camera can't see behind us."""
+        self.check_calls()
+        cm = max(5, min(DRIVE_CM, abs(cm or BACKUP_CM)))
+        text = self.tools.run("drive", {"distance_cm": -cm})[0]["text"]
+        print(f"   [back up {cm:.0f}cm] {text}")
+        return f"backed up about {cm:.0f} cm"
+
+    def unstick(self) -> str:
+        """Pushing against something without getting anywhere: back off and turn away."""
+        print("   [stuck: no forward progress, backing up]")
+        self.post("agent", "Stuck! Backing up")
+        self.chirp("alert")
+        self.back_up(BACKUP_CM)
+        self.turn(random.choice([60, -60, 90, -90]), quick=True)
+        return "got stuck, so backed up and turned away"
 
     def has_motors(self) -> bool:
         if self.tools.movement == "sim":
@@ -491,7 +622,9 @@ class Droid:
                 r = llm.chat([
                     {"role": "system", "content": self.persona},
                     {"role": "user", "content": (
-                        f"WHAT YOU SEE: {scene}\n\nCONVERSATION SO FAR:\n" + "\n".join(self.dialogue) +
+                        f"WHAT YOU SEE: {scene}\n\nWHERE THINGS ARE (your radar; old memories "
+                        f"are less reliable):\n{self.radar_summary()}\n\n"
+                        f"CONVERSATION SO FAR:\n" + "\n".join(self.dialogue) +
                         f"\n\nThe human just said: \"{heard}\"\n\n"
                         f"THINGS YOU CAN DO:\n{menu}\n\n"
                         "Reply in character with one short line. If the human asked you to do one "
@@ -547,20 +680,69 @@ def _wheel(v: float) -> float:
         return WHEEL_MIN if v > 0 else -WHEEL_MIN
     return max(-1.0, min(1.0, v))
 MODEL_CHECK_S = 3.0      # the model confirms the target this often (fixes tracker drift)
+DETECT_MISSES = 6        # detector tracking: this many frames in a row without it = lost
+RADAR_PERIOD_S = 0.6     # background detector -> radar update rate
 MAX_STEER = 0.2          # gentle steering while driving: keeps the view steady for the tracker
 SPIN_OFFSET = 0.25       # further off-centre than this: stop and turn toward it in pulses
 SPIN_PULSE_MS = 150
 
 
+def estimate_distance(box: Box, target: str) -> float:
+    """Very rough distance (cm) from how wide the thing looks. From the droid's low
+    camera, height is useless (a standing person fills it from 2 m away)."""
+    if any(w in target for w in ("person", "human", "man", "woman", "kid", "child", "me")):
+        k = 32          # a person ~0.4 of the frame wide is about 80 cm away
+    elif any(w in target for w in ("dog", "cat", "pet", "puppy", "kitten")):
+        k = 35
+    else:
+        k = 50
+    return max(30.0, min(500.0, k / max(box.w, 0.05)))
+
+
+def _ago(s: float) -> str:
+    return f"{s:.0f} s ago" if s < 90 else f"{s / 60:.0f} min ago" if s < 5400 else f"{s / 3600:.1f} h ago"
+
+
+def _sure(c: float) -> str:
+    return ("sure" if c >= 0.7 else "fairly sure" if c >= 0.4 else "not very sure"
+            if c >= 0.15 else "probably moved")
+
+
+def describe_memory(m: dict) -> str:
+    """'- dog: 30 deg to your right, ~1.2 m, seen 40 s ago (fairly sure)'"""
+    rel = m["relative_deg"]
+    side = ("straight ahead" if abs(rel) < 12 else "behind you" if abs(rel) > 155
+            else f"{abs(rel):.0f} deg to your {'right' if rel > 0 else 'left'}")
+    dist = f", ~{m['distance_cm'] / 100:.1f} m" if m.get("distance_cm") is not None else ""
+    return f"- {m['thing']}: {side}{dist}, seen {_ago(m['age_s'])} ({_sure(m['confidence'])})"
+
+
 def _search(d: Droid, target: str, step: float = 60, max_turns: int = 6) -> Box | None:
     """Turn in place until [target] is in view, or a full circle is done.
-    Scanning turns don't need to be precise, so they're quick ones."""
+    Scanning turns don't need to be precise, so they're quick ones. If the radar
+    remembers where it was, look there first."""
+    m = d.recall_one(target)
+    if m and m["confidence"] >= 0.25 and abs(m["relative_deg"]) > HFOV / 2 - 10:
+        print(f"   [radar: the {m['thing']} was {m['relative_deg']:+.0f} deg, "
+              f"{_sure(m['confidence'])}; looking there first]")
+        d.turn(m["relative_deg"], quick=True)
+    fast = d.can_detect(target)
     for i in range(max_turns + 1):
-        box = d.find(target)
+        box = d.find(target, fast_only=fast)      # detector only: a quick lap
         if box:
             return box
         if i < max_turns:
             d.turn(step, quick=True)
+    if fast:
+        # The detector can miss things (a dog curled up, half hidden): one slower
+        # lap with the vision model before giving up
+        print(f"   [search: detector didn't see the {target}; another lap with the vision model]")
+        for i in range(max_turns + 1):
+            box = d.find(target)
+            if box:
+                return box
+            if i < max_turns:
+                d.turn(step, quick=True)
     return None
 
 
@@ -614,16 +796,33 @@ def _track(d: Droid, target: str, box: Box, jpeg: bytes, follow: bool, t_end: fl
            reached: bool) -> str:
     """One tracking run, until the target is reached, lost, or time is up."""
     width = _track_width(box)
-    tracker = Tracker(decode(jpeg, width), box)
-    last_check = time.time()
+    detect = d.can_detect(target)     # everyday things: detect every frame, no pauses
+    tracker = None if detect else Tracker(decode(jpeg, width), box)
+    b = box
+    misses = 0
+    last_check = last_mark = time.time()
     last_print = 0.0
     while time.time() < t_end:
         d.check_calls()
         jpeg = d.snap().jpeg
-        b = tracker.update(decode(jpeg, width))
-        if b is None:
-            return "arrived, then lost" if reached else "lost"
-        if time.time() - last_check > MODEL_CHECK_S:
+        if detect:
+            found = d.det.find(jpeg, target, last=b)
+            if found is None:
+                misses += 1
+                if misses >= DETECT_MISSES:
+                    return "arrived, then lost" if reached else "lost"
+                d.velocity(0, 0, 300)            # don't drive blind; look again
+                continue
+            misses = 0
+            b = found
+            if time.time() - last_mark > 1.0:
+                last_mark = time.time()
+                d.remember(target, b.cx - 0.5, estimate_distance(b, target), 0.9)
+        else:
+            b = tracker.update(decode(jpeg, width))
+            if b is None:
+                return "arrived, then lost" if reached else "lost"
+        if not detect and time.time() - last_check > MODEL_CHECK_S:
             # Every few seconds the model confirms the target (and fixes tracker drift)
             d.bridge.velocity(0, 0, 300)
             m = locate(jpeg, target)
@@ -633,6 +832,7 @@ def _track(d: Droid, target: str, box: Box, jpeg: bytes, follow: bool, t_end: fl
             b = m
             width = _track_width(m)
             tracker = Tracker(decode(jpeg, width), m)
+            d.remember(target, m.cx - 0.5, estimate_distance(m, target), 0.9)
         offset = b.cx - 0.5                     # -0.5 (far left) .. +0.5 (far right)
         if b.near(target):
             if not follow:
@@ -656,6 +856,9 @@ def _track(d: Droid, target: str, box: Box, jpeg: bytes, follow: bool, t_end: fl
             r = d.velocity(left, right, ttl_ms=400)
         if r.get("ended") in ("bump", "tilt"):
             return f"stopped on a {r['ended']} on the way to the {target}"
+        if r.get("ended") == "stuck":
+            d.back_up(BACKUP_CM)
+            return f"got stuck on the way to the {target} (no forward progress), so backed up"
         d.show(b, target, f"{'following' if follow else 'going to'} {target}  off-centre "
                           f"{offset:+.2f}  wheels {left:+.2f}/{right:+.2f}"
                           f"{'  (close)' if b.near(target) else ''}", "green")
@@ -769,7 +972,7 @@ def look_around(d: Droid, target: str | None) -> str:
     d.goal = "look around the room"
     things = []
     for i in range(4):
-        p = d.look()
+        p = d.look(things=True)          # taking it all in: unusual things go on the radar too
         if p.interesting:
             things.append(p.interesting)
         if i < 3:
@@ -784,6 +987,14 @@ def custom_mission(d: Droid, target: str | None) -> str:
     return run_goal(d, target)
 
 
+def back_up_mission(d: Droid, target: str | None) -> str:
+    try:
+        cm = float(target) if target else BACKUP_CM
+    except ValueError:
+        cm = BACKUP_CM
+    return d.back_up(cm)
+
+
 def gesture_mission(d: Droid, target: str | None) -> str:
     return d.gesture(target or "dance")
 
@@ -792,6 +1003,8 @@ def gesture_mission(d: Droid, target: str | None) -> str:
 MISSIONS = {
     "gesture": (gesture_mission, "Do a fun move. target: dance, happy_spin, wiggle, nod, shake, "
                 "look_around, double_take, sad or surprised."),
+    "back_up": (back_up_mission, "Reverse a little, e.g. when asked to back up. target: "
+                "centimeters, or ''."),
     "custom_mission": (custom_mission, "Anything else, especially requests with several steps "
                        "(e.g. 'check if the dog is asleep and come tell me'). Put the whole "
                        "request in target."),

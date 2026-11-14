@@ -50,9 +50,14 @@ class DroidDepotDriver(private val ble: BleManager, private val settings: Settin
 
     fun status(): JSONObject = ble.status().put("driver", name).put("ready", connected)
 
+    /** What the wheels were last told to do (for dead reckoning). */
+    @Volatile var left = 0.0; private set
+    @Volatile var right = 0.0; private set
+
     /** Wheel speeds in -1..1 (positive = forward). */
     override fun drive(left: Double, right: Double) {
         if (!connected) throw Unavailable("droid not connected")
+        this.left = left; this.right = right
         send(0, left, force = false)
         send(1, right, force = false)
     }
@@ -64,6 +69,7 @@ class DroidDepotDriver(private val ble: BleManager, private val settings: Settin
     }
 
     override fun stop() {
+        left = 0.0; right = 0.0
         if (!ble.isConnected()) return
         // Stopping matters most. First an immediate stop to every motor (no
         // waiting for acknowledgements), then the same again, confirmed.

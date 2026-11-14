@@ -31,7 +31,8 @@ class Memory:
 
 def allowed_missions(history: list[Memory], p: Perception) -> list[str]:
     """Rules the model can't override, to keep the droid from getting stuck in loops."""
-    allowed = [m for m in MISSIONS if m != "custom_mission"]   # those need a goal from a human
+    # custom missions need a goal from a human; backing up is only on request
+    allowed = [m for m in MISSIONS if m not in ("custom_mission", "back_up")]
 
     def drop(name):
         if name in allowed and len(allowed) > 1:
@@ -57,6 +58,7 @@ def pick_mission(d: Droid, p: Perception, history: list[Memory]) -> dict:
     recent = "\n".join(f"- {h.mission}: {h.outcome}" for h in history[-5:]) or "- (just woke up)"
     prompt = (
         f"WHAT YOU SEE RIGHT NOW: {p.summary()}\n\n"
+        f"WHERE THINGS ARE (your radar; old memories are less reliable):\n{d.radar_summary()}\n\n"
         f"WHAT YOU DID RECENTLY:\n{recent}\n\n"
         f"MISSIONS YOU CAN DO NEXT:\n{menu}\n\n"
         "Pick the mission that makes the most sense now, and avoid repeating yourself. "

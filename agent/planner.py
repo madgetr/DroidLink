@@ -31,9 +31,13 @@ SKILLS = {
     "find": ("Turn around until you see something, then face it.", "the thing, e.g. 'dog'"),
     "go_to": ("Find something and drive right up to it.", "the thing, e.g. 'couch'"),
     "follow": ("Follow something (usually a person) for about 30 seconds.", "the thing"),
-    "face": ("Turn back toward something you found earlier (uses your memory).", "the thing"),
+    "face": ("Turn toward something on your radar (where you saw it before). Quicker than "
+             "find, if the memory is recent.", "the thing"),
     "turn": ("Turn in place. Positive = right, negative = left.", "degrees, e.g. '90'"),
-    "drive": ("Drive straight forward, if the way is clear.", "centimeters, e.g. '40'"),
+    "drive": ("Drive straight forward, if the way is clear. Stops by itself if you get stuck.",
+              "centimeters, e.g. '40'"),
+    "back_up": ("Reverse straight back, e.g. when stuck or too close to something.",
+                "centimeters, e.g. '20'"),
     "say": ("Say something out loud to the humans. Only say things you've actually seen or "
             "confirmed with your other skills.", "what to say"),
     "ask": ("Ask the humans a question out loud and hear their answer.", "the question"),
@@ -60,7 +64,7 @@ Steps:
 """
 
 MAX_STEPS = 15
-MOVES = {"turn", "drive", "face", "find", "go_to", "follow", "scan", "gesture"}   # skills that change the view
+MOVES = {"turn", "drive", "back_up", "face", "find", "go_to", "follow", "scan", "gesture"}   # skills that change the view
 
 
 class Mission:
@@ -86,12 +90,14 @@ class Mission:
 
     def next_step(self) -> dict:
         steps = "\n".join(f'  {s} "{a}" -> {r}' for s, a, r in self.history[-8:]) or "  (none yet)"
-        memory = ", ".join(f"{k} (seen)" for k in self.d.memory) or "nothing yet"
+        memory = self.d.radar_summary()
         scene = self.d.last.summary() if self.d.last else "(haven't looked yet)"
         left = MAX_STEPS - len(self.history)
         prompt = (
             f"Goal: {self.goal}\nPlan: {self.plan}\n\nSteps so far:\n{steps}\n\n"
-            f"What you saw last: {scene}\nThings you remember: {memory}\n"
+            f"What you saw last: {scene}\nYour radar (where things are, from what you've "
+            f"seen; old memories are less reliable, and 'face' only works on trustworthy "
+            f"ones):\n{memory}\n"
             f"Steps left: {left}\n\n"
             "Choose the ONE next skill, following your plan. Don't repeat a step that already "
             "gave you an answer. If the steps so far already answer the goal, use done now "
@@ -189,7 +195,7 @@ class Mission:
         if skill == "scan":
             seen = []
             for i in range(4):
-                p = d.look()
+                p = d.look(things=True)
                 seen.append(f"direction {i + 1} ({i * 90} deg right of start): {p.summary()}")
                 if i < 3:
                     d.turn(90, quick=True)
@@ -214,6 +220,8 @@ class Mission:
             cm = _number(arg, 40)
             p = d.look()
             return f"drove about {cm:.0f} cm" if d.drive(cm, p) else "didn't drive: the way ahead isn't clear"
+        if skill == "back_up":
+            return d.back_up(_number(arg, 20))
         if skill == "say":
             d.utter(random.choice(["bweep!", "dwoo-weet!", "beep-boop!"]), arg, "happy", listen=False)
             return "said it"

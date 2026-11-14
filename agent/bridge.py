@@ -23,6 +23,7 @@ class Snapshot:
         self.pitch = _maybe_float(headers.get("X-Pitch"))
         self.roll = _maybe_float(headers.get("X-Roll"))
         self.torch = headers.get("X-Torch") == "on"       # flashlight was on for this shot
+        self.yaw = _maybe_float(headers.get("X-Yaw"))     # gyro heading when it was taken
 
 
 def _maybe_float(v):
@@ -153,6 +154,46 @@ class DroidBridge:
     def settings(self) -> dict:
         """The droid's saved settings (name, voice) from the phone app."""
         body, _ = self._get("/settings")
+        return json.loads(body)
+
+    # --- radar: what the droid has seen and where (confidence fades on the phone)
+
+    def memory(self) -> dict:
+        """{pose, travel_cm, trail, items: [{thing, kind, relative_deg, distance_cm,
+        age_s, confidence, uncertainty_cm, ...}]} (most recent first)."""
+        body, _ = self._get("/memory")
+        return json.loads(body)
+
+    def memory_see(self, thing: str, offset: float | None = None, bearing: float | None = None,
+                   distance_cm: float | None = None, confidence: float = 0.9,
+                   hfov: float = 90, detector: bool = False) -> dict:
+        """Put [thing] on the radar: [offset] across the current view (-0.5 left .. 0.5
+        right) or an absolute gyro [bearing], and how far away if known."""
+        q = {"thing": thing, "confidence": f"{confidence:.2f}", "hfov": f"{hfov:.0f}"}
+        if detector:
+            q["detector"] = "1"
+        if bearing is not None:
+            q["bearing"] = f"{bearing:.1f}"
+        else:
+            q["offset"] = f"{offset or 0:.3f}"
+        if distance_cm is not None:
+            q["distance"] = f"{distance_cm:.0f}"
+        body, _ = self._get("/memory/see?" + urllib.parse.urlencode(q))
+        return json.loads(body)
+
+    def memory_missed(self, yaw: float, seen_ids: list[int], hfov: float = 90) -> dict:
+        """The detector looked around heading [yaw] and saw only [seen_ids]: things it
+        knows that should have been in view lose confidence, and vanish if gone."""
+        body, _ = self._get("/memory/missed?" + urllib.parse.urlencode(
+            {"yaw": f"{yaw:.1f}", "hfov": f"{hfov:.0f}", "seen": ",".join(map(str, seen_ids))}))
+        return json.loads(body)
+
+    def memory_doubt(self, thing: str, factor: float = 0.4, id: int | None = None) -> dict:
+        """Looked where [thing] should be and it wasn't there: trust that memory less."""
+        q = {"thing": thing, "factor": f"{factor:.2f}"}
+        if id is not None:
+            q["id"] = str(id)
+        body, _ = self._get("/memory/doubt?" + urllib.parse.urlencode(q))
         return json.loads(body)
 
     # --- voice (DroidLink 0.3+)

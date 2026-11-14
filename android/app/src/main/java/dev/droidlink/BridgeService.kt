@@ -29,6 +29,8 @@ class BridgeService : Service() {
     private lateinit var droid: DroidDepotDriver
     private lateinit var ears: VoiceInput
     private lateinit var gestures: Gestures
+    private lateinit var odometry: Odometry
+    private lateinit var world: WorldMemory
     private val log = AgentLog()
     private val overlay = Overlay()
     private lateinit var settings: Settings
@@ -43,7 +45,9 @@ class BridgeService : Service() {
         camera = CameraHub(this) { sensors.lux() }
         settings = Settings(this)
         droid = DroidDepotDriver(ble, settings)
-        motion = MotionController(sensors, droid, settings)
+        odometry = Odometry(sensors, { droid.left to droid.right }, settings)
+        world = WorldMemory(odometry)
+        motion = MotionController(sensors, droid, settings).also { it.camera = camera; it.odometry = odometry }
         sound = SoundHub(this)
         gestures = Gestures({ droid }, motion, settings) { mood ->
             try { sound.chirp(mood, null) } catch (_: Exception) {}
@@ -111,6 +115,7 @@ class BridgeService : Service() {
         droidLink = null
         service = null
         motion.stop()
+        odometry.shutdown()
         try { droid.disconnect() } catch (_: Exception) {}
         server?.stop()
         server = null
@@ -239,6 +244,26 @@ class BridgeService : Service() {
                     .put("head_angle", motion.headAngle))
             }
             path == "/control/stop" -> Json(motion.stop())
+            // --- what the droid has seen, and where (confidence fades); drawn as the panel's radar
+            path == "/memory" -> Json(world.snapshot())
+            path == "/memory/see" -> Json(world.see(need("thing"),
+                p["bearing"]?.toDoubleOrNull(), p["offset"]?.toDoubleOrNull(),
+                p["hfov"]?.toDoubleOrNull() ?: 90.0, p["distance"]?.toDoubleOrNull(),
+                p["confidence"]?.toDoubleOrNull() ?: 0.9, p["kind"], flag("detector", false)))
+            path == "/memory/missed" -> Json(world.missed(num("yaw"), p["hfov"]?.toDoubleOrNull() ?: 90.0,
+                (p["seen"] ?: "").split(",").mapNotNull { it.trim().toIntOrNull() }.toSet()))
+            path == "/memory/doubt" -> Json(world.doubt(need("thing"), p["factor"]?.toDoubleOrNull() ?: 0.4, p["id"]?.toIntOrNull())
+                ?: JSONObject().put("thing", p["thing"]).put("known", false))
+            path == "/memory/forget" -> { world.forget(p["thing"]); Json(world.snapshot()) }
+            path == "/memory/reset" -> { world.forget(null); odometry.reset(); Json(world.snapshot()) }
+            path == "/control/view_change" -> {         // tuning the stuck detector: how much
+                val cam = p["camera"] ?: motion.progressCamera   // the view changes over `ms`
+                val a = camera.fingerprint(cam) ?: throw Unavailable("no camera frame yet")
+                Thread.sleep((p["ms"]?.toLongOrNull() ?: 1000L).coerceIn(100, 5000))
+                val b = camera.fingerprint(cam) ?: throw Unavailable("no camera frame yet")
+                Json(JSONObject().put("change", MotionController.viewChange(a, b))
+                    .put("still_below", motion.stillDiff))
+            }
             path == "/control/turn" -> Json(motion.turn(
                 num("degrees").coerceIn(-180.0, 180.0),
                 tolerance = p["tolerance"]?.toDoubleOrNull()?.coerceIn(2.0, 30.0) ?: 5.0,
@@ -336,6 +361,7 @@ class BridgeService : Service() {
     private fun poseHeaders(): Map<String, String> {
         if (sensors.azimuth.isNaN()) return emptyMap()
         return mapOf(
+            "X-Yaw" to "%.1f".format(java.util.Locale.US, sensors.yaw),   // gyro heading (radar bearings)
             "X-Azimuth" to "%.1f".format(sensors.azimuth),
             "X-Pitch" to "%.1f".format(sensors.pitch),
             "X-Roll" to "%.1f".format(sensors.roll),

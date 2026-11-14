@@ -231,6 +231,29 @@ class CameraHub(ctx: Context, private val ambientLux: () -> Float?) {
     private fun hasFlash(id: String) =
         cm.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
 
+    /**
+     * A tiny 16x12 brightness map of the latest frame from camera [id], for telling
+     * whether the view is changing (are we actually moving?). Null if no frame yet.
+     */
+    fun fingerprint(id: String): IntArray? {
+        lastUse = System.currentTimeMillis()
+        ensureOpen(id)
+        val f = latest ?: return null
+        val gw = 16; val gh = 12
+        val out = IntArray(gw * gh)
+        val bw = f.width / gw; val bh = f.height / gh
+        for (gy in 0 until gh) for (gx in 0 until gw) {
+            var sum = 0; var n = 0
+            // Average each block (sampled) so motor vibration doesn't look like motion
+            for (y in gy * bh until (gy + 1) * bh step 6) {
+                val row = y * f.width
+                for (x in gx * bw until (gx + 1) * bw step 6) { sum += f.nv21[row + x].toInt() and 0xff; n++ }
+            }
+            out[gy * gw + gx] = if (n == 0) 0 else sum / n
+        }
+        return out
+    }
+
     /** Average brightness (0-255) of a frame, sampled on a coarse grid. */
     private fun luma(f: Frame): Int {
         var sum = 0L

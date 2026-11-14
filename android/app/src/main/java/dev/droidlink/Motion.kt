@@ -2,6 +2,7 @@ package dev.droidlink
 
 import org.json.JSONObject
 import kotlin.math.abs
+import kotlin.math.min
 import kotlin.math.sign
 
 /** Low-level motor control. Speeds are -1..1; positive = forward. */
@@ -43,6 +44,43 @@ class MotionController(
     var bumpThreshold = 8.0      // m/s^2 of linear acceleration that counts as a bump
     var tiltLimitDeg = 20.0      // max change in pitch/roll from the start of a move
 
+    /** Set by the service: used to notice we're driving forward but not getting anywhere. */
+    @Volatile var camera: CameraHub? = null
+    @Volatile var odometry: Odometry? = null      // to undo "distance" driven while stuck
+    var progressCamera = "2"     // the camera that looks ahead (same one the agent and panel use)
+    var stuckMs = 2_000L         // forward with no change in view for this long = stuck
+    var stillDiff = STILL_DIFF   // view change (0-255 scale) below which nothing moved
+    @Volatile var lastViewChange = 0.0   // latest measurement, for tuning (/control/status)
+
+    /**
+     * Stuck detector: while driving forward, compare the camera view every 250 ms with
+     * the view when we last saw progress. Pushing against a wall or caught on a rug, the
+     * wheels turn but the view doesn't change. Brightness changes (auto-exposure, the
+     * flashlight) don't count: each map is compared relative to its own average.
+     */
+    private inner class ProgressWatch {
+        private var ref: IntArray? = null
+        private var refT = 0L
+        private var lastSample = 0L
+        val since get() = refT              // last time the view changed
+
+        /** True when we've been going forward for [stuckMs] without the view changing. */
+        fun stuck(forward: Boolean): Boolean {
+            val cam = camera
+            if (!forward || cam == null) { ref = null; return false }
+            val now = System.currentTimeMillis()
+            if (now - lastSample < 250) return false
+            lastSample = now
+            val fp = try { cam.fingerprint(progressCamera) } catch (e: Exception) { null } ?: return false
+            val r = ref
+            if (r == null) { ref = fp; refT = now; return false }
+            val change = viewChange(r, fp)
+            lastViewChange = change
+            if (change > stillDiff) { ref = fp; refT = now; return false }
+            return now - refT > stuckMs
+        }
+    }
+
     fun config(turnPower: Float?, drivePower: Float?, minPower: Float?, cmPerSecond: Float?,
                coastS: Float? = null, rampMs: Int? = null, easeDeg: Float? = null): JSONObject {
         turnPower?.let { settings.turnPower = it }
@@ -71,6 +109,7 @@ class MotionController(
         .put("heading", sensors.azimuth.takeUnless { it.isNaN() } ?: JSONObject.NULL)
         .put("yaw", sensors.yaw.takeUnless { it.isNaN() } ?: JSONObject.NULL)
         .put("last", lastResult ?: JSONObject.NULL)
+        .put("view_change", Math.round(lastViewChange * 10) / 10.0)   // stuck detector, for tuning
 
     fun stop(): JSONObject {
         stopRequested = true
@@ -157,8 +196,12 @@ class MotionController(
                 velEnded = try {
                     move("velocity", VELOCITY_BUMP) { guard ->
                         var reason = "released"
+                        val progress = ProgressWatch()
                         while (System.currentTimeMillis() < velDeadline) {
                             val g = guard(); if (g != null) { reason = g; break }
+                            if (progress.stuck(min(velLeft, velRight) > 0.2)) {
+                                odometry?.rewind(progress.since); reason = "stuck"; break
+                            }
                             driver.drive(velLeft, velRight)
                             Thread.sleep(20)
                         }
@@ -404,14 +447,17 @@ class MotionController(
         JSONObject().put("left", left).put("right", right).put("seconds", seconds).put("result", reason)
     }
 
-    /** Drive straight [cm] (negative = backwards). Distance is time-based for now. */
+    /** Drive straight [cm] (negative = backwards). Distance is time-based for now.
+     *  Going forward, stops early with result "stuck" if the view stops changing. */
     fun drive(cm: Double, timeoutS: Double = 15.0): JSONObject = move("drive") { guard ->
         val seconds = (abs(cm) / cmPerSecond).coerceAtMost(timeoutS)
         val power = driveSpeed * sign(cm)
         val t0 = System.currentTimeMillis()
         var reason = "done"
+        val progress = ProgressWatch()
         while (System.currentTimeMillis() - t0 < seconds * 1000) {
             val g = guard(); if (g != null) { reason = g; break }
+            if (progress.stuck(cm > 0)) { odometry?.rewind(progress.since); reason = "stuck"; break }
             driver.drive(power, power)
             Thread.sleep(20)
         }
@@ -459,6 +505,15 @@ class MotionController(
         private const val TURN_BUMP = 20.0
         private const val VELOCITY_BUMP = 14.0   // steering while driving jolts the phone a bit
         private const val BUMP_GRACE_MS = 400L
+        private const val STILL_DIFF = 3.0   // standing still measures 0.2-0.4
+
+        /** How different two brightness maps are (0-255), ignoring overall brightness. */
+        fun viewChange(a: IntArray, b: IntArray): Double {
+            val ma = a.average(); val mb = b.average()
+            var sum = 0.0
+            for (i in a.indices) sum += abs((a[i] - ma) - (b[i] - mb))
+            return sum / a.size
+        }
 
         /** Signed shortest angle from [b] to [a], degrees in -180..180. */
         fun angleDiff(a: Double, b: Double) = (a - b + 540) % 360 - 180

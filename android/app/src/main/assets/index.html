@@ -59,6 +59,20 @@
   #say { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid var(--line);
          background: #0f1520; color: var(--text); font: inherit; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  #radar { width: 100%; max-width: 520px; aspect-ratio: 1; display: block; margin: 0 auto;
+           touch-action: pan-y; cursor: zoom-in; }
+  .zoom { display: flex; gap: 4px; align-items: center; }
+  .zoom button { min-width: 34px; }
+  .zoom .on { background: var(--accent); border-color: var(--accent); }
+  .radar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .radar-head h2 { margin: 0; }
+  .radar-head button { padding: 4px 10px; font-size: 12px; }
+  #memlist { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; font-size: 13px; }
+  #memlist .m { display: flex; gap: 8px; align-items: baseline; }
+  #memlist .bar { flex: 0 0 48px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  #memlist .bar i { display: block; height: 100%; background: var(--accent); }
+  #memlist .what { flex: 1; }
+  #memlist .meta { color: var(--muted); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -73,6 +87,22 @@
   <div class="col">
     <div class="card">
       <img id="cam" alt="camera" src="/camera/stream?camera=2&fps=8&width=480">
+    </div>
+    <div class="card">
+      <div class="radar-head"><h2>Radar</h2>
+        <div class="zoom">
+          <button id="zoomout" title="Zoom out">−</button>
+          <button id="zoomauto" title="Fit everything">Auto</button>
+          <button id="zoomin" title="Zoom in">+</button>
+          <button id="clearmap">Clear map</button>
+        </div></div>
+      <canvas id="radar"></canvas>
+      <div id="memlist"></div>
+      <div class="hint">What the droid has seen, around it (it faces up). Faint = an old or
+        unsure memory: people fade in about a minute, pets in a few, furniture in half an hour,
+        and everything fades as the droid drives (its sense of position drifts). Dashed lines
+        are directions with no distance. The faint path is where it has been.
+        Zoom with + / −, the mouse wheel, or pinch; Auto fits everything.</div>
     </div>
     <div class="card">
       <h2>Talk</h2>
@@ -280,6 +310,151 @@ $("connect").onclick = async () => {
   $("connect").textContent = r.ready ? "Connected" : ("Couldn't connect: " + (r.detail || "?"));
   setTimeout(() => $("connect").textContent = "Connect to the droid", 4000);
 };
+
+// -------------------------------------------------------------------- radar
+const KIND_COLOR = { person: "#3b8cff", pet: "#f2b33d", object: "#3ccf74" };
+function ago(s) {
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  return `${(s / 3600).toFixed(1)} h ago`;
+}
+function drawRadar(m) {
+  const cv = $("radar"), dpr = window.devicePixelRatio || 1;
+  const size = cv.clientWidth;
+  if (cv.width !== Math.round(size * dpr)) { cv.width = cv.height = Math.round(size * dpr); }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, size, size);
+  const cx = size / 2, cy = size / 2, R = size / 2 - 14;
+  const pose = m.pose || { x: 0, y: 0, yaw: 0 };
+  const items = m.items || [];
+  // Range: fit the farthest known thing (and the trail), in 1/2/4/8 m steps
+  let far = 150;
+  for (const it of items) if (it.distance_cm != null) far = Math.max(far, it.distance_cm + it.uncertainty_cm * 0.5);
+  lastAutoRange = [200, 400, 800, 1600].find(r => r >= far) || 1600;
+  const range = zoomRange ?? lastAutoRange;
+  $("zoomauto").classList.toggle("on", zoomRange == null);
+  const k = R / range;
+  const h = pose.yaw * Math.PI / 180;
+  const toScreen = (wx, wy) => {          // world cm -> screen, droid at centre facing up
+    const dx = wx - pose.x, dy = wy - pose.y;
+    const fwd = dx * Math.sin(h) + dy * Math.cos(h), right = dx * Math.cos(h) - dy * Math.sin(h);
+    return [cx + right * k, cy - fwd * k];
+  };
+  const css = getComputedStyle(document.body);
+  const line = css.getPropertyValue("--line").trim() || "#2a3546";
+  const muted = css.getPropertyValue("--muted").trim() || "#8a98ad";
+
+  // Rings every metre (or 2 m when zoomed out) and the camera's view
+  const step = [25, 50, 100, 200, 400].find(s => range / s <= 5) || 400;
+  g.strokeStyle = line; g.lineWidth = 1; g.fillStyle = muted; g.font = "11px system-ui, sans-serif";
+  for (let r = step; r <= range; r += step) {
+    g.beginPath(); g.arc(cx, cy, r * k, 0, Math.PI * 2); g.stroke();
+    g.fillText(r < 100 ? `${r} cm` : `${r / 100} m`, cx + 4, cy - r * k + 12);
+  }
+  g.fillStyle = "rgba(59,140,255,0.08)";
+  g.beginPath(); g.moveTo(cx, cy); g.arc(cx, cy, R, -Math.PI / 2 - Math.PI / 4, -Math.PI / 2 + Math.PI / 4); g.closePath(); g.fill();
+
+  // Where it has been
+  const trail = m.trail || [];
+  if (trail.length > 1) {
+    g.strokeStyle = "rgba(138,152,173,0.35)"; g.lineWidth = 2; g.setLineDash([]);
+    g.beginPath();
+    trail.concat([[pose.x, pose.y]]).forEach(([x, y], i) => { const [sx, sy] = toScreen(x, y); i ? g.lineTo(sx, sy) : g.moveTo(sx, sy); });
+    g.stroke();
+  }
+
+  // Things it has seen (oldest first, so fresh ones draw on top)
+  for (const it of items.slice().reverse()) {
+    const a = Math.max(0.12, Math.min(1, it.confidence));
+    const col = KIND_COLOR[it.kind] || KIND_COLOR.object;
+    g.globalAlpha = a;
+    let lx, ly;
+    if (it.x != null) {
+      const [sx, sy] = toScreen(it.x, it.y);
+      g.fillStyle = col; g.globalAlpha = a * 0.18;              // where it might be by now
+      g.beginPath(); g.arc(sx, sy, Math.max(6, it.uncertainty_cm * k), 0, Math.PI * 2); g.fill();
+      g.globalAlpha = a;
+      g.beginPath(); g.arc(sx, sy, 5, 0, Math.PI * 2); g.fill();
+      lx = sx + 8; ly = sy + 4;
+    } else {
+      const t = it.relative_deg * Math.PI / 180;                // direction only: a dashed ray
+      const ex = cx + Math.sin(t) * R, ey = cy - Math.cos(t) * R;
+      g.strokeStyle = col; g.lineWidth = 2; g.setLineDash([5, 5]);
+      g.beginPath(); g.moveTo(cx + Math.sin(t) * 14, cy - Math.cos(t) * 14); g.lineTo(ex, ey); g.stroke();
+      g.setLineDash([]);
+      lx = ex + (Math.sin(t) >= 0 ? -4 : 4); ly = ey + (Math.cos(t) >= 0 ? 14 : -6);
+      g.textAlign = Math.sin(t) >= 0 ? "right" : "left";
+    }
+    g.fillStyle = col; g.font = "12px system-ui, sans-serif";
+    g.fillText(it.thing, lx, ly);
+    g.textAlign = "left";
+  }
+  g.globalAlpha = 1;
+
+  // The droid
+  g.fillStyle = "#e8edf4";
+  g.beginPath(); g.moveTo(cx, cy - 11); g.lineTo(cx - 8, cy + 8); g.lineTo(cx, cy + 4); g.lineTo(cx + 8, cy + 8); g.closePath(); g.fill();
+
+  // The list, most confident first
+  const list = $("memlist");
+  list.replaceChildren(...items.slice().sort((p, q) => q.confidence - p.confidence).map(it => {
+    const row = document.createElement("div"); row.className = "m";
+    const side = Math.abs(it.relative_deg) < 15 ? "ahead" : Math.abs(it.relative_deg) > 150 ? "behind"
+               : `${Math.round(Math.abs(it.relative_deg))}° ${it.relative_deg > 0 ? "right" : "left"}`;
+    const dist = it.distance_cm != null ? ` · ~${(it.distance_cm / 100).toFixed(1)} m` : "";
+    row.innerHTML = `<span class="bar"><i></i></span><span class="what"></span><span class="meta"></span>`;
+    row.querySelector("i").style.width = `${Math.round(it.confidence * 100)}%`;
+    row.querySelector("i").style.background = KIND_COLOR[it.kind] || KIND_COLOR.object;
+    row.querySelector(".what").textContent = it.thing;
+    row.querySelector(".meta").textContent = `${side}${dist} · ${ago(it.age_s)} · ${Math.round(it.confidence * 100)}%`;
+    return row;
+  }));
+  if (!items.length) list.innerHTML = `<div class="meta">Nothing seen yet.</div>`;
+}
+// Zoom: null = fit everything; otherwise the radius shown, in cm
+let zoomRange = null, lastMem = null, lastAutoRange = 400;
+const ZMIN = 50, ZMAX = 2000;
+function currentRange() {
+  if (zoomRange != null) return zoomRange;
+  return lastAutoRange;
+}
+function setZoom(r) {
+  zoomRange = r == null ? null : Math.max(ZMIN, Math.min(ZMAX, r));
+  if (lastMem) drawRadar(lastMem);
+}
+$("zoomin").onclick = () => setZoom(currentRange() / 2);
+$("zoomout").onclick = () => setZoom(currentRange() * 2);
+$("zoomauto").onclick = () => setZoom(null);
+$("radar").addEventListener("wheel", (e) => {
+  e.preventDefault();
+  setZoom(currentRange() * Math.exp(e.deltaY * 0.0015));
+}, { passive: false });
+// Pinch with two fingers
+const pts = new Map();
+let pinch0 = null;
+const spread = () => { const [a, b] = [...pts.values()]; return Math.hypot(a.x - b.x, a.y - b.y); };
+$("radar").addEventListener("pointerdown", (e) => {
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pts.size === 2) pinch0 = { d: spread(), r: currentRange() };
+});
+$("radar").addEventListener("pointermove", (e) => {
+  if (!pts.has(e.pointerId)) return;
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pts.size === 2 && pinch0) { e.preventDefault(); setZoom(pinch0.r * pinch0.d / Math.max(10, spread())); }
+});
+for (const ev of ["pointerup", "pointercancel", "pointerleave"])
+  $("radar").addEventListener(ev, (e) => { pts.delete(e.pointerId); if (pts.size < 2) pinch0 = null; });
+$("radar").addEventListener("dblclick", () => setZoom(null));
+
+async function pollRadar() {
+  const m = await get("/memory");
+  if (m.pose) { lastMem = m; drawRadar(m); }
+}
+$("clearmap").onclick = async () => { drawRadar(await get("/memory/reset")); };
+window.addEventListener("resize", pollRadar);
+setInterval(pollRadar, 1000);
+pollRadar();
 
 setInterval(pollLog, 1000);
 setInterval(pollStatus, 1500);
