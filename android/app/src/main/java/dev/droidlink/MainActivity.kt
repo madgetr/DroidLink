@@ -4,6 +4,9 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.graphics.Typeface
 import android.net.wifi.WifiManager
 import android.os.Bundle
@@ -13,8 +16,12 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -28,7 +35,8 @@ import android.widget.TextView
 import android.widget.Toast
 import kotlin.concurrent.thread
 
-/** Start/stop the bridge, and a simple settings panel: droid name and voice. */
+/** Two tabs: Settings (start/stop the bridge, name, voice, flashlight) and Drive
+ *  (the same control panel the browser gets, for driving from the phone itself). */
 class MainActivity : Activity() {
 
     private lateinit var settings: Settings
@@ -47,6 +55,12 @@ class MainActivity : Activity() {
         override fun run() { refreshDroid(); ui.postDelayed(this, 2_000) }
     }
     private var voiceIds: List<String> = emptyList()
+    private lateinit var settingsPage: View
+    private lateinit var drivePage: FrameLayout
+    private var web: WebView? = null
+    private lateinit var tabSettings: Button
+    private lateinit var tabDrive: Button
+    private var driving = false
     private val ui = Handler(Looper.getMainLooper())
 
     // The first three are required; microphone and notifications are optional
@@ -61,6 +75,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         settings = Settings(this)
+        actionBar?.hide()          // the tab row is the header
         setContentView(buildUi())
         // Start right away if we already have permission, so a relaunch "just works"
         if (hasPermissions() && !BridgeService.running) startBridge()
@@ -76,6 +91,12 @@ class MainActivity : Activity() {
     override fun onPause() {
         super.onPause()
         ui.removeCallbacks(droidPoll)
+        if (driving) showTab(drive = false)   // let go of the controls and stop the video
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (driving) showTab(drive = false) else @Suppress("DEPRECATION") super.onBackPressed()
     }
 
     private fun refreshDroid() {
@@ -111,6 +132,64 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ UI
 
     private fun buildUi(): View {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun tab(label: String, drive: Boolean) = Button(this).apply {
+            text = label; textSize = 16f
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showTab(drive) }
+        }
+        tabSettings = tab("Settings", false); tabDrive = tab("Drive", true)
+        tabs.addView(tabSettings); tabs.addView(tabDrive)
+        root.addView(tabs)
+
+        settingsPage = buildSettings()
+        drivePage = FrameLayout(this)
+        val fill = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        root.addView(settingsPage, fill)
+        root.addView(drivePage, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        showTab(drive = false)
+        // Android 15 draws apps edge to edge: keep clear of the status and navigation bars
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
+        return root
+    }
+
+    /** Drive = the bridge's own control panel (assets/index.html) in a WebView. Created
+     *  when opened and destroyed when left, so the video stream and controls stop. */
+    private fun showTab(drive: Boolean) {
+        driving = drive
+        for ((tab, current) in listOf(tabSettings to !drive, tabDrive to drive)) {
+            tab.backgroundTintList = ColorStateList.valueOf(if (current) ACCENT else PANEL)
+            tab.setTextColor(if (current) Color.WHITE else MUTED)
+        }
+        settingsPage.visibility = if (drive) View.GONE else View.VISIBLE
+        drivePage.visibility = if (drive) View.VISIBLE else View.GONE
+        drivePage.removeAllViews()
+        web?.let { it.loadUrl("about:blank"); it.destroy() }
+        web = null
+        if (!drive) { refresh(); return }
+        if (!BridgeService.running) {
+            drivePage.addView(TextView(this).apply {
+                text = "Start the bridge on the Settings tab first."
+                textSize = 18f; gravity = Gravity.CENTER
+            })
+            return
+        }
+        web = WebView(this).apply {
+            @Suppress("SetJavaScriptEnabled")
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            webViewClient = WebViewClient()   // keep links inside the tab
+            loadUrl("http://127.0.0.1:${BridgeService.PORT}/")
+        }
+        drivePage.addView(web)
+    }
+
+    private fun buildSettings(): View {
         val pad = dp(20)
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -131,6 +210,7 @@ class MainActivity : Activity() {
         col.addView(droidStatus)
         col.addView(droidButton)
         col.addView(Switch(this).apply {
+            tint(this)
             text = "Connect automatically when the app starts"; textSize = 14f
             isChecked = settings.autoConnect
             setOnCheckedChangeListener { _, on -> settings.autoConnect = on }
@@ -145,7 +225,7 @@ class MainActivity : Activity() {
         nameField = EditText(this).apply {
             setText(settings.name)
             textSize = 24f
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS
             imeOptions = EditorInfo.IME_ACTION_DONE
             setOnEditorActionListener { _, action, _ ->
                 if (action == EditorInfo.IME_ACTION_DONE) { saveName(); true } else false
@@ -156,7 +236,7 @@ class MainActivity : Activity() {
 
         // --- voice
         col.addView(header("Voice"))
-        voiceSpinner = Spinner(this)
+        voiceSpinner = Spinner(this).apply { setPopupBackgroundDrawable(ColorDrawable(PANEL)) }
         col.addView(voiceSpinner)
 
         pitchLabel = TextView(this)
@@ -170,6 +250,7 @@ class MainActivity : Activity() {
             settings.rate = v; updateLabels()
         })
         col.addView(Switch(this).apply {
+            tint(this)
             text = "Robot effect"; textSize = 16f; isChecked = settings.robot
             setOnCheckedChangeListener { _, on -> settings.robot = on }
         })
@@ -179,7 +260,8 @@ class MainActivity : Activity() {
         col.addView(header("Flashlight"))
         val modes = listOf("auto" to "Auto (on when it's dark)", "on" to "Always on", "off" to "Off")
         col.addView(Spinner(this).apply {
-            adapter = ArrayAdapter(context, android.R.layout.simple_spinner_dropdown_item, modes.map { it.second })
+            adapter = darkAdapter(modes.map { it.second })
+            setPopupBackgroundDrawable(ColorDrawable(PANEL))
             setSelection(modes.indexOfFirst { it.first == settings.torchMode }.coerceAtLeast(0))
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
@@ -213,6 +295,23 @@ class MainActivity : Activity() {
 
         updateLabels()
         return ScrollView(this).apply { addView(col) }
+    }
+
+    /** Dropdown with light text: the stock spinner layouts draw dark text on our dark theme. */
+    private fun darkAdapter(items: List<String>) =
+        object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, items) {
+            init { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+            override fun getView(pos: Int, convert: View?, parent: ViewGroup) =
+                super.getView(pos, convert, parent).also { (it as TextView).setTextColor(TEXT); it.textSize = 18f }
+            override fun getDropDownView(pos: Int, convert: View?, parent: ViewGroup) =
+                super.getDropDownView(pos, convert, parent).also { (it as TextView).setTextColor(TEXT) }
+        }
+
+    /** On = bright blue, off = grey: the dark theme's defaults look the same both ways. */
+    private fun tint(sw: Switch) {
+        val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+        sw.thumbTintList = ColorStateList(states, intArrayOf(ACCENT, Color.rgb(0x9A, 0xA6, 0xB8)))
+        sw.trackTintList = ColorStateList(states, intArrayOf(Color.argb(0x80, 0x3B, 0x8C, 0xFF), Color.rgb(0x3A, 0x45, 0x56)))
     }
 
     private fun header(text: String) = TextView(this).apply {
@@ -254,13 +353,12 @@ class MainActivity : Activity() {
     private fun loadVoices(attempt: Int = 0) {
         val v = BridgeService.voice
         if (v == null || !v.ready) {
-            if (attempt < 20) ui.postDelayed({ loadVoices(attempt + 1) }, 500)
+            if (attempt < 120) ui.postDelayed({ loadVoices(attempt + 1) }, 500)   // TTS can take a while after a restart
             return
         }
         val choices = v.voiceChoices()
         voiceIds = choices.map { it.first }
-        voiceSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
-            choices.map { it.second })
+        voiceSpinner.adapter = darkAdapter(choices.map { it.second })
         voiceIds.indexOf(v.currentVoice).takeIf { it >= 0 }?.let { voiceSpinner.setSelection(it) }
         voiceSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
@@ -332,5 +430,11 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    companion object { private const val REQUEST_PERMS = 1 }
+    companion object {
+        private const val REQUEST_PERMS = 1
+        private val ACCENT = Color.rgb(0x3B, 0x8C, 0xFF)   // same palette as the control panel
+        private val PANEL = Color.rgb(0x22, 0x30, 0x46)
+        private val MUTED = Color.rgb(0x8A, 0x98, 0xAD)
+        private val TEXT = Color.rgb(0xE8, 0xED, 0xF4)
+    }
 }

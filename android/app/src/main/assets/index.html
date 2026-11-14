@@ -10,6 +10,13 @@
     --accent: #3b8cff; --ok: #3ccf74; --warn: #f2b33d; --bad: #f05252;
   }
   * { box-sizing: border-box; }
+  /* An app, not a document: no text selection, long-press menus or tap flashes on
+     controls (Android's WebView needs the -webkit- forms). The chat log and inputs stay
+     selectable. */
+  html { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+         -webkit-tap-highlight-color: transparent; }
+  input, textarea, #log { -webkit-user-select: text; user-select: text; }
+  img { -webkit-user-drag: none; pointer-events: none; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;

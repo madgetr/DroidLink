@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_bg">#1B2433</color>
+    <!-- Same palette as the control panel -->
+    <color name="bg">#0F141C</color>
+    <color name="panel">#18202C</color>
+    <color name="text">#E8EDF4</color>
+    <color name="muted">#8A98AD</color>
+    <color name="accent">#3B8CFF</color>
 </resources>

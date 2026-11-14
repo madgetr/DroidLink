@@ -35,6 +35,7 @@
     <application
         android:label="DroidLink"
         android:icon="@mipmap/ic_launcher"
+        android:theme="@style/DroidLinkTheme"
         android:usesCleartextTraffic="true">
 
         <activity
