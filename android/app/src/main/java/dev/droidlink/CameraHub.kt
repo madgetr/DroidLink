@@ -401,36 +401,39 @@ class CameraHub(ctx: Context, private val ambientLux: () -> Float?) {
             ?: sizes.filter { it.width <= 1920 }.maxByOrNull { it.width * it.height }
             ?: sizes.first()
 
-    private fun toNv21(img: Image): ByteArray {
-        val w = img.width
-        val h = img.height
-        val out = ByteArray(w * h * 3 / 2)
-        val y = img.planes[0]
-        val yBuf = y.buffer
-        var pos = 0
-        if (y.pixelStride == 1 && y.rowStride == w) {
-            yBuf.get(out, 0, w * h); pos = w * h
-        } else {
-            for (row in 0 until h) {
-                yBuf.position(row * y.rowStride)
-                yBuf.get(out, pos, w); pos += w
-            }
-        }
-        val u = img.planes[1].buffer
-        val v = img.planes[2].buffer
-        val rowStride = img.planes[2].rowStride
-        val pixStride = img.planes[2].pixelStride
-        for (row in 0 until h / 2) {
-            for (col in 0 until w / 2) {
-                val i = row * rowStride + col * pixStride
-                out[pos++] = v.get(i)
-                out[pos++] = u.get(i)
-            }
-        }
-        return out
-    }
+    private fun toNv21(img: Image): ByteArray = Companion.toNv21(img)
 
     companion object {
+        /** YUV_420_888 image -> NV21 bytes. */
+        fun toNv21(img: Image): ByteArray {
+            val w = img.width
+            val h = img.height
+            val out = ByteArray(w * h * 3 / 2)
+            val y = img.planes[0]
+            val yBuf = y.buffer
+            var pos = 0
+            if (y.pixelStride == 1 && y.rowStride == w) {
+                yBuf.get(out, 0, w * h); pos = w * h
+            } else {
+                for (row in 0 until h) {
+                    yBuf.position(row * y.rowStride)
+                    yBuf.get(out, pos, w); pos += w
+                }
+            }
+            val u = img.planes[1].buffer
+            val v = img.planes[2].buffer
+            val rowStride = img.planes[2].rowStride
+            val pixStride = img.planes[2].pixelStride
+            for (row in 0 until h / 2) {
+                for (col in 0 until w / 2) {
+                    val i = row * rowStride + col * pixStride
+                    out[pos++] = v.get(i)
+                    out[pos++] = u.get(i)
+                }
+            }
+            return out
+        }
+
         private const val TAG = "CameraHub"
         private const val IDLE_CLOSE_MS = 60_000L
         private const val TORCH_IDLE_OFF_MS = 30_000L   // flashlight off after 30 s without a snapshot

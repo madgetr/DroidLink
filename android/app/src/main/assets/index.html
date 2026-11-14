@@ -102,7 +102,9 @@
       <div class="hint">What the droid has seen, around it (it faces up). Faint = an old or
         unsure memory: people fade in about a minute, pets in a few, furniture in half an hour,
         and everything fades as the droid drives (its sense of position drifts). Dashed lines
-        are directions with no distance. The faint path is where it has been.
+        are directions with no distance. The faint path is where it has been. The green squares are
+        floor it knows it can drive on, red squares are where it got blocked, and a dashed blue line
+        is the route it's taking.
         Zoom with + / −, the mouse wheel, or pinch; Auto fits everything.</div>
     </div>
     <div class="card">
@@ -346,6 +348,17 @@ function drawRadar(m) {
   const line = css.getPropertyValue("--line").trim() || "#2a3546";
   const muted = css.getPropertyValue("--muted").trim() || "#8a98ad";
 
+  // Walkable-space map underneath: green = floor it has driven or seen, red = blocked
+  if (lastMap && lastMap.cells) {
+    const c = lastMap.cell || 10, cs = lastMap.cells;
+    for (let i = 0; i + 2 < cs.length; i += 3) {
+      const wx = (cs[i] + 0.5) * c, wy = (cs[i + 1] + 0.5) * c;
+      const [sx, sy] = toScreen(wx, wy);
+      const half = Math.max(1, c * k * 0.55);
+      g.fillStyle = cs[i + 2] === 2 ? "rgba(240,82,82,0.55)" : "rgba(60,207,116,0.16)";
+      g.fillRect(sx - half, sy - half, half * 2, half * 2);
+    }
+  }
   // Rings every metre (or 2 m when zoomed out) and the camera's view
   const step = [25, 50, 100, 200, 400].find(s => range / s <= 5) || 400;
   g.strokeStyle = line; g.lineWidth = 1; g.fillStyle = muted; g.font = "11px system-ui, sans-serif";
@@ -365,6 +378,14 @@ function drawRadar(m) {
     g.stroke();
   }
 
+  // Where it's heading (A* path)
+  const nav = lastMap && lastMap.nav;
+  if (nav && nav.path && nav.path.length && nav.status !== "idle") {
+    g.strokeStyle = "#3b8cff"; g.lineWidth = 2; g.setLineDash([6, 4]);
+    g.beginPath();
+    [[pose.x, pose.y]].concat(nav.path).forEach(([x, y], i) => { const [sx, sy] = toScreen(x, y); i ? g.lineTo(sx, sy) : g.moveTo(sx, sy); });
+    g.stroke(); g.setLineDash([]);
+  }
   // Things it has seen (oldest first, so fresh ones draw on top)
   for (const it of items.slice().reverse()) {
     const a = Math.max(0.12, Math.min(1, it.confidence));
@@ -458,8 +479,10 @@ for (const ev of ["pointerup", "pointercancel", "pointerleave"])
   $("radar").addEventListener(ev, (e) => { pts.delete(e.pointerId); if (pts.size < 2) pinch0 = null; });
 $("radar").addEventListener("dblclick", () => setZoom(null));
 
+let lastMap = null;
 async function pollRadar() {
-  const m = await get("/memory");
+  const [m, map] = await Promise.all([get("/memory"), get(`/map?r=${Math.round(currentRange() * 1.5)}`)]);
+  if (map.cells) lastMap = map;
   if (m.pose) { lastMem = m; drawRadar(m); }
 }
 $("clearmap").onclick = async () => { drawRadar(await get("/memory/reset")); };

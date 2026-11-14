@@ -11,8 +11,8 @@ android {
         applicationId = "dev.droidlink"
         minSdk = 33          // Android 13+: modern BLE permissions and callbacks
         targetSdk = 35
-        versionCode = 59
-        versionName = "0.23.5"
+        versionCode = 63
+        versionName = "0.24.2"
     }
 
     buildTypes {

@@ -30,6 +30,8 @@ class BridgeService : Service() {
     private lateinit var ears: VoiceInput
     private lateinit var gestures: Gestures
     private lateinit var odometry: Odometry
+    private lateinit var navMap: NavMap
+    private lateinit var nav: Navigator
     private lateinit var world: WorldMemory
     private val log = AgentLog()
     private val overlay = Overlay()
@@ -49,12 +51,24 @@ class BridgeService : Service() {
         world = WorldMemory(odometry)
         motion = MotionController(sensors, droid, settings).also { it.camera = camera; it.odometry = odometry }
         odometry.view = { camera.fingerprintIfOpen(motion.progressCamera) }
+        // Walkable-space map: saved on the phone; driving over floor marks it free
+        navMap = NavMap(java.io.File(filesDir, "navmap.json")).also { it.load() }
+        nav = Navigator(navMap, odometry, motion)
+        odometry.onMoved = { x, y -> navMap.markFreeDisc(x, y) }
+        alignMap()
+        kotlin.concurrent.thread(name = "navmap-save", isDaemon = true) {
+            while (true) {
+                Thread.sleep(15_000)
+                if (navMap.dirty) navMap.save()
+            }
+        }
         // Stuck = something in front of us the camera may not even show (a low edge,
         // a rug, a chair leg): mark it on the radar just ahead of the droid's nose
         motion.onStuck = { relDeg ->
             try {
-                val yaw = sensors.yaw.takeUnless { it.isNaN() } ?: 0.0
-                world.see("obstacle", yaw + relDeg, null, 90.0, OBSTACLE_AHEAD_CM, 0.9, "obstacle")
+                val yaw = odometry.yaw
+                val o = world.see("obstacle", yaw + relDeg, null, 90.0, OBSTACLE_AHEAD_CM, 0.9, "obstacle")
+                if (!o.isNull("x")) navMap.markBlocked(o.getDouble("x"), o.getDouble("y"))
                 log.add("droid", if (relDeg == 0.0) "Stuck on something ahead: marked an obstacle"
                                  else "Couldn't turn ${if (relDeg > 0) "right" else "left"}: marked an obstacle", false)
             } catch (_: Exception) {}
@@ -126,6 +140,8 @@ class BridgeService : Service() {
         droidLink = null
         service = null
         motion.stop()
+        nav.cancel = true
+        navMap.save()
         odometry.shutdown()
         try { droid.disconnect() } catch (_: Exception) {}
         server?.stop()
@@ -254,7 +270,40 @@ class BridgeService : Service() {
                     .put("coast_s", settings.headCoastS).put("sign", settings.headSign)
                     .put("head_angle", motion.headAngle))
             }
-            path == "/control/stop" -> Json(motion.stop())
+            path == "/control/stop" -> { nav.cancel = true; Json(motion.stop()) }
+            // --- walkable-space map and path finding
+            path == "/map" -> Json(navMap.snapshot(odometry.x, odometry.y, p["r"]?.toDoubleOrNull() ?: 400.0)
+                .put("pose", JSONObject().put("x", odometry.x).put("y", odometry.y).put("yaw", odometry.yaw))
+                .put("nav", nav.json()))
+            path == "/map/free_cone" -> {               // the floor ahead looked clear
+                navMap.markFreeCone(odometry.x, odometry.y, odometry.yaw, num("dist").coerceIn(10.0, 150.0))
+                Json(JSONObject().put("ok", true))
+            }
+            path == "/map/ahead" -> Json(JSONObject().put("unknown",
+                navMap.unknownAhead(odometry.x, odometry.y, odometry.yaw, p["dist"]?.toDoubleOrNull() ?: 50.0)))
+            path == "/map/clear" -> { resetMap(); Json(JSONObject().put("ok", true)) }
+            path == "/map/path" -> {                    // plan only (no driving), for checking
+                val pth = navMap.path(odometry.x, odometry.y, num("x"), num("y"), flag("unknown", false))
+                Json(JSONObject().put("path", if (pth == null) JSONObject.NULL
+                    else org.json.JSONArray(pth.map { org.json.JSONArray().put(it.first).put(it.second) })))
+            }
+            path == "/map/mark" -> {                    // testing: mark a blocked spot at (x, y)
+                navMap.markBlocked(num("x"), num("y")); Json(JSONObject().put("ok", true))
+            }
+            path == "/nav/goto" -> {
+                val target = when {
+                    flag("home", false) -> 0.0 to 0.0
+                    p["thing"] != null -> world.locate(need("thing"))
+                        ?: throw IllegalArgumentException("no position on the radar for '${p["thing"]}'")
+                    else -> num("x") to num("y")
+                }
+                Json(nav.goTo(target.first, target.second, flag("unknown", false),
+                    p["stop_short"]?.toDoubleOrNull() ?: 0.0, null,
+                    p["timeout"]?.toDoubleOrNull() ?: 60.0))
+            }
+            path == "/nav/explore" -> Json(nav.exploreStep(p["timeout"]?.toDoubleOrNull() ?: 45.0))
+            path == "/nav/cancel" -> { nav.cancel = true; motion.stop(); Json(nav.json()) }
+            path == "/nav/status" -> Json(nav.json())
             // --- what the droid has seen, and where (confidence fades); drawn as the panel's radar
             path == "/memory" -> Json(world.snapshot())
             path == "/memory/see" -> Json(world.see(need("thing"),
@@ -266,7 +315,7 @@ class BridgeService : Service() {
             path == "/memory/doubt" -> Json(world.doubt(need("thing"), p["factor"]?.toDoubleOrNull() ?: 0.4, p["id"]?.toIntOrNull())
                 ?: JSONObject().put("thing", p["thing"]).put("known", false))
             path == "/memory/forget" -> { world.forget(p["thing"]); Json(world.snapshot()) }
-            path == "/memory/reset" -> { world.forget(null); odometry.reset(); Json(world.snapshot()) }
+            path == "/memory/reset" -> { world.forget(null); resetMap(); Json(world.snapshot()) }
             path == "/control/view_change" -> {         // tuning the stuck detector: how much
                 val cam = p["camera"] ?: motion.progressCamera   // the view changes over `ms`
                 val a = camera.fingerprint(cam) ?: throw Unavailable("no camera frame yet")
@@ -369,10 +418,48 @@ class BridgeService : Service() {
         return found.getJSONObject(0).getString("address")   // sorted by signal strength
     }
 
+    /**
+     * Line a saved map up with this session. Positions: the droid is assumed to start
+     * where it started when the map was made ("home"). Rotation: the gyro's zero is
+     * different every session, but the compass isn't, so the saved difference
+     * between compass and map heading tells us how to turn this session's gyro.
+     * (The motors bend the compass, but by the same amount every time.)
+     */
+    private fun alignMap() = kotlin.concurrent.thread(name = "align", isDaemon = true) {
+        Thread.sleep(1_500)                              // let the sensors settle
+        var sx = 0.0; var sy = 0.0; var n = 0
+        repeat(10) {
+            val c = sensors.azimuth; val g = sensors.yaw
+            if (!c.isNaN() && !g.isNaN()) {
+                val d = Math.toRadians(c - g); sx += kotlin.math.cos(d); sy += kotlin.math.sin(d); n++
+            }
+            Thread.sleep(100)
+        }
+        if (n == 0) return@thread
+        val compassMinusGyro = Math.toDegrees(kotlin.math.atan2(sy, sx))
+        val saved = navMap.compassMinusYaw
+        if (saved == null) {
+            navMap.compassMinusYaw = compassMinusGyro      // a new map: this session defines it
+            odometry.yawOffset = 0.0
+        } else {
+            odometry.yawOffset = MotionController.angleDiff(compassMinusGyro, saved)
+            log.add("droid", "Loaded the saved map (assuming I started at home)", false)
+        }
+        navMap.markFreeDisc(odometry.x, odometry.y)       // we're sitting on floor
+    }
+
+    private fun resetMap() {
+        nav.cancel = true
+        odometry.reset()
+        odometry.yawOffset = 0.0
+        navMap.clear()
+        alignMap()
+    }
+
     private fun poseHeaders(): Map<String, String> {
         if (sensors.azimuth.isNaN()) return emptyMap()
         return mapOf(
-            "X-Yaw" to "%.1f".format(java.util.Locale.US, sensors.yaw),   // gyro heading (radar bearings)
+            "X-Yaw" to "%.1f".format(java.util.Locale.US, odometry.yaw),   // map heading (radar bearings)
             "X-Azimuth" to "%.1f".format(sensors.azimuth),
             "X-Pitch" to "%.1f".format(sensors.pitch),
             "X-Roll" to "%.1f".format(sensors.roll),

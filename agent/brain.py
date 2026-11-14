@@ -32,7 +32,7 @@ class Memory:
 def allowed_missions(history: list[Memory], p: Perception) -> list[str]:
     """Rules the model can't override, to keep the droid from getting stuck in loops."""
     # custom missions need a goal from a human; backing up is only on request
-    allowed = [m for m in MISSIONS if m not in ("custom_mission", "back_up")]
+    allowed = [m for m in MISSIONS if m not in ("custom_mission", "back_up", "go_back_to")]
 
     def drop(name):
         if name in allowed and len(allowed) > 1:

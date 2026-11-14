@@ -18,7 +18,7 @@ import re
 import time
 
 from agent import llm
-from agent.missions import Droid, Interrupted, approach_target, find_target, beeps_hint
+from agent.missions import Droid, Interrupted, approach_target, find_target, go_back_to, go_home
 
 # name -> (what it does, what the argument is)
 SKILLS = {
@@ -38,6 +38,10 @@ SKILLS = {
               "centimeters, e.g. '40'"),
     "back_up": ("Reverse straight back, e.g. when stuck or too close to something.",
                 "centimeters, e.g. '20'"),
+    "go_back_to": ("Drive back to something on your radar using your map of the floor "
+                   "(path-finding around obstacles). Good for returning to a person or place.",
+                   "the thing, e.g. 'couch' or 'person'"),
+    "go_home": ("Drive back to where you started, using your map.", "nothing"),
     "say": ("Say something out loud to the humans. Only say things you've actually seen or "
             "confirmed with your other skills.", "what to say"),
     "ask": ("Ask the humans a question out loud and hear their answer.", "the question"),
@@ -64,7 +68,7 @@ Steps:
 """
 
 MAX_STEPS = 15
-MOVES = {"turn", "drive", "back_up", "face", "find", "go_to", "follow", "scan", "gesture"}   # skills that change the view
+MOVES = {"turn", "drive", "back_up", "go_back_to", "go_home", "face", "find", "go_to", "follow", "scan", "gesture"}   # skills that change the view
 
 
 class Mission:
@@ -228,6 +232,10 @@ class Mission:
             return f"drove about {cm:.0f} cm"
         if skill == "back_up":
             return d.back_up(_number(arg, 20))
+        if skill == "go_back_to":
+            return go_back_to(d, arg or "person")
+        if skill == "go_home":
+            return go_home(d, None)
         if skill == "say":
             d.utter(random.choice(["bweep!", "dwoo-weet!", "beep-boop!"]), arg, "happy", listen=False)
             return "said it"

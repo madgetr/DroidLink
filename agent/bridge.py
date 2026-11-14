@@ -35,9 +35,9 @@ class DroidBridge:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def _get(self, path: str):
+    def _get(self, path: str, timeout: float | None = None):
         try:
-            with urllib.request.urlopen(self.base_url + path, timeout=self.timeout) as r:
+            with urllib.request.urlopen(self.base_url + path, timeout=timeout or self.timeout) as r:
                 return r.read(), r.headers
         except urllib.error.HTTPError as e:
             if e.code == 503:
@@ -180,6 +180,43 @@ class DroidBridge:
             q["distance"] = f"{distance_cm:.0f}"
         body, _ = self._get("/memory/see?" + urllib.parse.urlencode(q))
         return json.loads(body)
+
+    # --- walkable-space map and path finding (on the phone)
+
+    def nav_goto(self, x: float | None = None, y: float | None = None, thing: str | None = None,
+                 home: bool = False, allow_unknown: bool = False, stop_short_cm: float = 0,
+                 timeout_s: float = 60) -> dict:
+        """Drive along an A* path over known floor to (x, y) cm, a remembered [thing]
+        on the radar, or [home] (where the droid started). Blocks until done:
+        {"result": "arrived" | "blocked" | "no path" | "timeout" | "interrupted: ...", ...}"""
+        q = {"unknown": "1" if allow_unknown else "0", "stop_short": f"{stop_short_cm:.0f}",
+             "timeout": f"{timeout_s:.0f}"}
+        if home:
+            q["home"] = "1"
+        elif thing:
+            q["thing"] = thing
+        else:
+            q.update(x=f"{x:.1f}", y=f"{y:.1f}")
+        body, _ = self._get("/nav/goto?" + urllib.parse.urlencode(q), timeout=timeout_s + 15)
+        return json.loads(body)
+
+    def nav_explore(self, timeout_s: float = 45) -> dict:
+        """Go to the nearest edge of the known floor and face the unknown."""
+        body, _ = self._get(f"/nav/explore?timeout={timeout_s:.0f}", timeout=timeout_s + 15)
+        return json.loads(body)
+
+    def nav_cancel(self) -> dict:
+        body, _ = self._get("/nav/cancel")
+        return json.loads(body)
+
+    def map_free_cone(self, dist_cm: float = 50) -> None:
+        """The floor ahead looked clear for [dist_cm]: mark it walkable on the map."""
+        self._get(f"/map/free_cone?dist={dist_cm:.0f}")
+
+    def map_unknown_ahead(self, dist_cm: float = 50) -> float:
+        """How much of the strip ahead is unexplored (0..1)."""
+        body, _ = self._get(f"/map/ahead?dist={dist_cm:.0f}")
+        return json.loads(body)["unknown"]
 
     def memory_missed(self, yaw: float, seen_ids: list[int], hfov: float = 90) -> dict:
         """The detector looked around heading [yaw] and saw only [seen_ids]: things it

@@ -84,7 +84,10 @@ COMMANDS = [
     (re.compile(r"\b(shake your head|say no)\b", re.I), ("gesture", "shake")),
     (re.compile(r"\b(nod|say yes)\b", re.I), ("gesture", "nod")),
     (re.compile(r"\b(wiggle|shimmy)\b", re.I), ("gesture", "wiggle")),
-    (re.compile(r"\b(back up|back off|backwards|reverse|go back|move back)\b(?!\s+to\b)", re.I), ("back_up", None)),
+    (re.compile(r"\b(back up|back off|backwards|reverse|go back|move back)\b(?!\s+(to|home)\b)", re.I), ("back_up", None)),
+    (re.compile(r"\b(go home|go back home|return home|go back to (the )?(start|beginning)|head home)\b", re.I),
+     ("go_home", None)),
+    (re.compile(rf"\b(?:go back to|return to|head back to) {_ART}{_TARGET}{_END}", re.I), ("go_back_to", None)),
     (re.compile(r"\bfollow (me|us)\b", re.I), ("follow_target", "person")),
     (re.compile(r"\b(come here|come to me|come over|over here)\b", re.I), ("approach_target", "person")),
     (re.compile(r"\blook around\b", re.I), ("look_around", None)),
@@ -346,7 +349,34 @@ class Droid:
         print(f"   [look @ {heading} deg, {p.seconds:.1f}s] {p.summary()}")
         self.last = p
         self._map_perception(p, dets)
+        if p.floor_ahead_clear:
+            self.mark_floor_clear()
         return p
+
+    def mark_floor_clear(self, dist_cm: float | None = None) -> None:
+        """The floor ahead looked clear: walkable on the map (best effort)."""
+        try:
+            self.bridge.map_free_cone(dist_cm or FLOOR_SEEN_CM)
+        except Exception:
+            pass
+
+    def navigate(self, **kw) -> dict:
+        """Path-find on the phone's walkable map (see DroidBridge.nav_goto). Calling the
+        droid's name interrupts it like any other move."""
+        self.check_calls()
+        if not self.motors_connected():
+            return {"result": "no motors"}
+        try:
+            r = self.bridge.nav_goto(**kw)
+        except Unavailable as e:
+            if "called" in str(e) or "override" in str(e):
+                raise Interrupted() from None
+            return {"result": f"unavailable: {e}"}
+        print(f"   [navigate {kw}: {r.get('result')} in {r.get('seconds')}s, "
+              f"{r.get('legs')} legs, {r.get('replans')} replans]")
+        if str(r.get("result", "")).startswith("interrupted"):
+            raise Interrupted()
+        return r
 
     def _map_perception(self, p: Perception, dets=None) -> None:
         """Everything the look saw goes on the radar. Detector boxes are precise; the
@@ -796,6 +826,10 @@ MODEL_CHECK_S = 3.0      # the model confirms the target this often (fixes track
 DETECT_MISSES = 6        # detector tracking: this many frames in a row without it = lost
 RADAR_PERIOD_S = 0.6     # background detector -> radar update rate
 HINT_S = 3.0             # a glance's box is good for this long (then search again)
+FLOOR_SEEN_CM = 50       # "floor ahead is clear" covers about this far
+SPIN_POWER = 0.45        # fast scan: spin pulses at this wheel power...
+SPIN_PULSE_S = 0.22      # ...this long each (~35-45 deg), a detector frame between pulses
+NAV_FIRST_CM = 100       # remembered target farther than this: path-find there first
 MAX_STEER = 0.2          # gentle steering while driving: keeps the view steady for the tracker
 SPIN_OFFSET = 0.25       # further off-centre than this: stop and turn toward it in pulses
 SPIN_PULSE_MS = 150
@@ -843,12 +877,17 @@ def _search(d: Droid, target: str, step: float = 60, max_turns: int = 6) -> Box 
               f"{_sure(m['confidence'])}; looking there first]")
         d.turn(m["relative_deg"], quick=True)
     fast = d.can_detect(target)
-    for i in range(max_turns + 1):
-        box = d.find(target, fast_only=fast)      # detector only: a quick lap
+    if fast and d.motors_connected():
+        box = _spin_search(d, target)              # quick lap: spin pulses + detector
         if box:
             return box
-        if i < max_turns:
-            d.turn(step, quick=True)
+    else:
+        for i in range(max_turns + 1):
+            box = d.find(target, fast_only=fast)
+            if box:
+                return box
+            if i < max_turns:
+                d.turn(step, quick=True)
     if fast:
         # The detector can miss things (a dog curled up, half hidden): one slower
         # lap with the vision model before giving up
@@ -859,6 +898,45 @@ def _search(d: Droid, target: str, step: float = 60, max_turns: int = 6) -> Box 
                 return box
             if i < max_turns:
                 d.turn(step, quick=True)
+    return None
+
+
+def _spin_search(d: Droid, target: str, max_deg: float = 370) -> Box | None:
+    """Fast scan for something the detector knows: short spin pulses, with a sharp
+    detector frame (0.1 s) after each, until it's seen or we've gone all the way round.
+    Then turn to face it (we've spun a bit past by the time we see it)."""
+    try:
+        start = d.bridge.yaw()
+    except Exception:
+        start = None
+    if start is None:
+        return None
+    blocked = 0
+    t0 = time.time()
+    while time.time() - t0 < 25:
+        d.check_calls()
+        snap = d.bridge.snapshot(camera=d.camera, width=640)
+        box = d.det.find(snap.jpeg, target)
+        if box is not None:
+            # Where it was when the photo was taken, then turn there from where we are now
+            if snap.yaw is not None:
+                rel = (snap.yaw + (box.cx - 0.5) * HFOV) - d.bridge.yaw()
+                rel = (rel + 540) % 360 - 180
+                print(f"   [spin search: {target} spotted, turning {rel:+.0f}]")
+                if abs(rel) > CENTER_TOL * HFOV:
+                    d.turn(rel)
+            return d.find(target) or box
+        yaw = snap.yaw if snap.yaw is not None else d.bridge.yaw()
+        if yaw is not None and abs(yaw - start) >= max_deg:
+            print(f"   [spin search: no {target} all the way round]")
+            return None
+        r = d.velocity(SPIN_POWER, -SPIN_POWER, ttl_ms=int(SPIN_PULSE_S * 1000))
+        time.sleep(SPIN_PULSE_S + 0.12)               # spin, then let the picture settle
+        if r.get("ended") == "blocked":
+            blocked += 1
+            if blocked > 2:
+                return None
+            d.back_up(BACKUP_CM)
     return None
 
 
@@ -1034,7 +1112,15 @@ def approach_target(d: Droid, target: str, follow: bool = False, max_s: float = 
     """Find the target, face it, then drive to it (and keep following) with tracking."""
     if announce:
         d.goal = f"{'follow' if follow else 'go to'} the {target}"
-    box = d.take_hint(target) or _search(d, target)     # just seen it? go straight there
+    box = d.take_hint(target)                           # just seen it? go straight there
+    if box is None:
+        m = d.recall_one(target)
+        if (m and m.get("distance_cm") and m["distance_cm"] > NAV_FIRST_CM and m["confidence"] >= 0.3
+                and m.get("kind") != "obstacle"):
+            # Remembered it over there: path-find most of the way on the known map
+            print(f"   [approach: the {m['thing']} was ~{m['distance_cm'] / 100:.1f} m away; navigating there]")
+            d.navigate(thing=m["thing"], stop_short_cm=60, allow_unknown=True)
+        box = _search(d, target)
     if box is None:
         if announce:
             d.say(f"You looked all around but couldn't find the {target}.", speak=True)
@@ -1098,7 +1184,7 @@ def explore(d: Droid, target: str | None) -> str:
     """Wander around: drive where it's clear, turn where it isn't."""
     d.goal = "explore the room"
     seen: list[str] = []
-    for step in range(8):
+    for step in range(10):
         # Quick: detector glance + yes/no floor check (~1 s). A full look every 3rd step.
         if step % 3 == 2:
             p = d.look()
@@ -1110,6 +1196,8 @@ def explore(d: Droid, target: str | None) -> str:
                     p.floor_ahead_clear = floor_clear(snap.jpeg)
                 except Exception:
                     p.floor_ahead_clear = False
+                if p.floor_ahead_clear:
+                    d.mark_floor_clear()
             for x in dets:                  # leave a hint so a follow-up mission starts there
                 if x.label == "person" or x.label in PETS:
                     d.give_hint(x.label, x.box)
@@ -1120,8 +1208,19 @@ def explore(d: Droid, target: str | None) -> str:
             return f"while exploring, found a {p.pet_kind or 'pet'}"
         if p.interesting and p.interesting not in seen:
             seen.append(p.interesting)
-        if not d.drive(DRIVE_CM, p):
-            d.turn(random.choice([60, 90, -60, -90]), quick=True)
+        # Into the unknown: if the way ahead is clear and unexplored, go; otherwise
+        # path-find (over known floor) to the nearest edge of the explored area
+        try:
+            unknown = d.bridge.map_unknown_ahead(DRIVE_CM)
+        except Exception:
+            unknown = 1.0
+        if p.floor_ahead_clear and unknown > 0.3:
+            d.drive(DRIVE_CM, p)
+            continue
+        r = d.bridge.nav_explore() if d.motors_connected() else {"result": "no motors"}
+        print(f"   [explore: frontier -> {r.get('result')}]")
+        if r.get("result") in ("nothing left to explore nearby", "no reachable frontier", "no motors", "no path"):
+            d.turn(random.choice([60, 90, -60, -90]), quick=True)   # look somewhere new
     if seen:
         d.say("While exploring you saw: " + ", ".join(seen[-3:]) + ".")
     return "explored and saw: " + ", ".join(seen[-4:]) if seen else "explored but found nothing new"
@@ -1155,6 +1254,29 @@ def back_up_mission(d: Droid, target: str | None) -> str:
     return d.back_up(cm)
 
 
+def go_home(d: Droid, target: str | None) -> str:
+    """Path-find back to where the droid started, over the floor it knows."""
+    d.goal = "go back home"
+    r = d.navigate(home=True, allow_unknown=True)
+    if r.get("result") == "arrived":
+        d.chirp("happy")
+        return "went back home"
+    return f"tried to go home: {r.get('result')}"
+
+
+def go_back_to(d: Droid, target: str | None) -> str:
+    """Path-find back to something on the radar (e.g. 'the couch'), then face it."""
+    target = target or "person"
+    d.goal = f"go back to the {target}"
+    r = d.navigate(thing=target, stop_short_cm=50, allow_unknown=True)
+    if "no position" in str(r.get("result", "")) or r.get("result", "").startswith("unavailable"):
+        return approach_target(d, target, announce=False)     # not on the map: look for it
+    if r.get("result") == "arrived":
+        d.face(target)
+        return f"went back to the {target}"
+    return f"tried to go back to the {target}: {r.get('result')}"
+
+
 def gesture_mission(d: Droid, target: str | None) -> str:
     return d.gesture(target or "dance")
 
@@ -1165,6 +1287,9 @@ MISSIONS = {
                 "look_around, double_take, sad or surprised."),
     "back_up": (back_up_mission, "Reverse a little, e.g. when asked to back up. target: "
                 "centimeters, or ''."),
+    "go_home": (go_home, "Drive back to where you started, using your map."),
+    "go_back_to": (go_back_to, "Drive back to something you saw before (on your radar), using "
+                   "your map. target: the thing, e.g. 'couch'."),
     "custom_mission": (custom_mission, "Anything else, especially requests with several steps "
                        "(e.g. 'check if the dog is asleep and come tell me'). Put the whole "
                        "request in target."),
