@@ -97,6 +97,7 @@
           <button id="clearmap">Clear map</button>
         </div></div>
       <canvas id="radar"></canvas>
+      <div id="odo" class="hint" style="text-align:center"></div>
       <div id="memlist"></div>
       <div class="hint">What the droid has seen, around it (it faces up). Faint = an old or
         unsure memory: people fade in about a minute, pets in a few, furniture in half an hour,
@@ -312,7 +313,7 @@ $("connect").onclick = async () => {
 };
 
 // -------------------------------------------------------------------- radar
-const KIND_COLOR = { person: "#3b8cff", pet: "#f2b33d", object: "#3ccf74" };
+const KIND_COLOR = { person: "#3b8cff", pet: "#f2b33d", object: "#3ccf74", obstacle: "#f05252" };
 function ago(s) {
   if (s < 60) return `${Math.round(s)}s ago`;
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
@@ -375,7 +376,13 @@ function drawRadar(m) {
       g.fillStyle = col; g.globalAlpha = a * 0.18;              // where it might be by now
       g.beginPath(); g.arc(sx, sy, Math.max(6, it.uncertainty_cm * k), 0, Math.PI * 2); g.fill();
       g.globalAlpha = a;
-      g.beginPath(); g.arc(sx, sy, 5, 0, Math.PI * 2); g.fill();
+      if (it.kind === "obstacle") {                           // where it got stuck: a red X
+        g.strokeStyle = col; g.lineWidth = 3; g.setLineDash([]);
+        g.beginPath(); g.moveTo(sx - 6, sy - 6); g.lineTo(sx + 6, sy + 6);
+        g.moveTo(sx + 6, sy - 6); g.lineTo(sx - 6, sy + 6); g.stroke();
+      } else {
+        g.beginPath(); g.arc(sx, sy, 5, 0, Math.PI * 2); g.fill();
+      }
       lx = sx + 8; ly = sy + 4;
     } else {
       const t = it.relative_deg * Math.PI / 180;                // direction only: a dashed ray
@@ -395,6 +402,10 @@ function drawRadar(m) {
   // The droid
   g.fillStyle = "#e8edf4";
   g.beginPath(); g.moveTo(cx, cy - 11); g.lineTo(cx - 8, cy + 8); g.lineTo(cx, cy + 4); g.lineTo(cx + 8, cy + 8); g.closePath(); g.fill();
+
+  $("odo").textContent = `Driven ~${((m.travel_cm || 0) / 100).toFixed(1)} m` +
+    (m.discarded_cm > 1 ? ` · ignored ${((m.discarded_cm) / 100).toFixed(1)} m of wheel spin (camera saw no movement)` : "") +
+    (m.moving_confirmed === false ? " · stuck?" : "");
 
   // The list, most confident first
   const list = $("memlist");

@@ -16,7 +16,7 @@ from pathlib import Path
 
 from agent import detector as detection
 from agent import llm
-from agent.detector import RADAR_NAME, coco_class
+from agent.detector import PETS, RADAR_NAME, coco_class
 from agent.bridge import DroidBridge, Unavailable
 from agent.perception import DISTANCE_CM, SPOT_OFFSET, Perception, floor_clear, perceive
 from agent.tools import DroidTools
@@ -61,7 +61,11 @@ def beeps_hint() -> str:
 
 
 DRIVE_CM = 40          # longest single drive while things are experimental
-BACKUP_CM = 20         # how far to reverse when stuck or asked to back up
+BACKUP_CM = 15         # how far to reverse when stuck or asked to back up
+DETOUR_DEG = 50        # going around an obstacle: turn this far to one side...
+DETOUR_CM = 25         # ...drive this far, then turn back
+AVOID_CM = 35          # tracking: a marked obstacle this close ahead -> go around it first
+MAX_DETOURS = 3
 HFOV = 90.0            # ultrawide's horizontal field of view in portrait (measured ~90, degrees)
 CENTER_TOL = 0.08      # target counts as centred within this fraction of the frame
 
@@ -147,6 +151,7 @@ class Droid:
         # Fast object detector (CPU): finds/tracks common things and keeps the radar
         # filled in the background, so the vision model isn't asked for those
         self.det = detection.shared()
+        self.hint: tuple[str, Box, float] | None = None   # (target, box, when) from a glance
         self.radar_on = self.det is not None
         if self.det:
             threading.Thread(target=self._radar_loop, daemon=True).start()
@@ -195,6 +200,38 @@ class Droid:
                 pass
 
     # --- radar: the detector watches all the time
+
+    def glance(self):
+        """Quick look with the detector only (~0.2 s): (snapshot, detections)."""
+        snap = self.snap()
+        return snap, (self.det.detect(snap.jpeg) if self.det else [])
+
+    def glance_perception(self, dets) -> Perception:
+        """A Perception from a detector glance, for quick decisions (no vision model).
+        The floor isn't judged here (missions that drive check it themselves)."""
+        from agent.perception import _distance, _where
+        names = sorted({RADAR_NAME.get(x.label, x.label) for x in dets if x.conf >= 0.45})
+        person = next((x for x in dets if x.label == "person" and x.conf >= 0.45), None)
+        pet = next((x for x in dets if x.label in PETS and x.conf >= 0.4), None)
+        return Perception(
+            scene=("In view: " + ", ".join(names) + ".") if names else "Nothing in particular in view.",
+            person_where=_where(person.box.cx) if person else "none",
+            person_distance=_distance(person.box) if person else "none",
+            pet_kind=pet.label if pet else "",
+            pet_where=_where(pet.box.cx) if pet else "none",
+            pet_distance=_distance(pet.box) if pet else "none",
+            floor_ahead_clear=True, interesting="")
+
+    def give_hint(self, target: str, box: Box) -> None:
+        """We just saw [target] at [box]: the next mission can start from there."""
+        self.hint = (target, box, time.time())
+
+    def take_hint(self, target: str) -> Box | None:
+        h, self.hint = self.hint, None
+        if h and time.time() - h[2] < HINT_S and (h[0] in target or target in h[0]
+                                                  or coco_class(h[0]) == coco_class(target)):
+            return h[1]
+        return None
 
     def can_detect(self, target: str) -> bool:
         """Can the fast detector find this (one of its 80 everyday things)?"""
@@ -429,19 +466,40 @@ class Droid:
     # --- body
 
     def turn(self, degrees: float, quick: bool = False) -> None:
-        """Turn in place. quick=True skips the fine correction (fine for scanning)."""
+        """Turn in place. quick=True skips the fine correction (fine for scanning).
+        If something blocks the turn (the gyro says we aren't rotating; the phone
+        marks it on the radar): back up a little and try again, then try turning the
+        other way round instead."""
         self.check_calls()
         if self.motors_connected():
-            try:
-                r = self.bridge.turn(degrees, tolerance=12 if quick else 5, attempts=1 if quick else 5)
-            except Unavailable as e:
-                if "called" in str(e) or "override" in str(e):
-                    raise Interrupted() from None
-                raise
-            print(f"   [turn {degrees:+.0f}{' quick' if quick else ''}] turned {r['turned']:+.0f} "
-                  f"({r['result']})")
+            remaining = degrees
+            for attempt in range(3):
+                r = self._turn_once(remaining, quick)
+                remaining -= r["turned"]
+                if r["result"] != "blocked" or abs(remaining) < 12:
+                    return
+                if attempt == 0:
+                    print("   [turn blocked: backing up a bit and trying again]")
+                    self.post("agent", "Can't turn that way: backing up")
+                    self.back_up(BACKUP_CM)
+                else:
+                    # Still blocked: go the long way round instead (e.g. right 90 -> left 270)
+                    remaining -= 360 * (1 if remaining > 0 else -1)
+                    print(f"   [turn still blocked: going the other way ({remaining:+.0f})]")
+                    self.post("agent", "Still blocked: turning the other way")
         else:
             print(f"   [turn {degrees:+.0f}] " + self.tools.run("turn", {"degrees": degrees})[0]["text"])
+
+    def _turn_once(self, degrees: float, quick: bool) -> dict:
+        try:
+            r = self.bridge.turn(degrees, tolerance=12 if quick else 5, attempts=1 if quick else 5)
+        except Unavailable as e:
+            if "called" in str(e) or "override" in str(e):
+                raise Interrupted() from None
+            raise
+        print(f"   [turn {degrees:+.0f}{' quick' if quick else ''}] turned {r['turned']:+.0f} "
+              f"({r['result']})")
+        return r
 
     def velocity(self, left: float, right: float, ttl_ms: int = 400) -> dict:
         """Stream wheel speeds; someone calling our name interrupts the mission."""
@@ -472,10 +530,16 @@ class Droid:
             print("   [drive refused: floor ahead not clear]")
             return False
         cm = max(-DRIVE_CM, min(DRIVE_CM, cm))
+        if cm > 0:
+            ob = self.obstacle_ahead(cm)
+            if ob:
+                print(f"   [drive: the radar has an obstacle {ob['distance_cm']:.0f} cm ahead "
+                      f"(stuck there before); going around it]")
+                return self.go_around() is not None
         text = self.tools.run("drive", {"distance_cm": cm})[0]["text"]
         print(f"   [drive {cm:+.0f}cm] {text}")
-        if "stuck" in text:          # wheels turning but the view stopped changing
-            self.unstick()
+        if "stuck" in text or "bump" in text:   # wheels spinning in place, or ran into something
+            self.go_around()
         return True
 
     def back_up(self, cm: float = None) -> str:
@@ -486,14 +550,63 @@ class Droid:
         print(f"   [back up {cm:.0f}cm] {text}")
         return f"backed up about {cm:.0f} cm"
 
-    def unstick(self) -> str:
-        """Pushing against something without getting anywhere: back off and turn away."""
-        print("   [stuck: no forward progress, backing up]")
-        self.post("agent", "Stuck! Backing up")
-        self.chirp("alert")
-        self.back_up(BACKUP_CM)
-        self.turn(random.choice([60, -60, 90, -90]), quick=True)
-        return "got stuck, so backed up and turned away"
+    def obstacles(self) -> list[dict]:
+        """Places on the radar where we got stuck before (still trusted)."""
+        return [m for m in self.recall() if m.get("kind") == "obstacle" and m["confidence"] >= 0.15]
+
+    def obstacle_ahead(self, cm: float, width_deg: float = 25) -> dict | None:
+        """A known obstacle in our path within [cm] (plus the droid's length)?"""
+        for m in self.obstacles():
+            d = m.get("distance_cm")
+            if d is not None and d <= cm + 25 and abs(m["relative_deg"]) <= width_deg:
+                return m
+        return None
+
+    def pick_side(self, prefer: int = 0) -> int:
+        """Which way to go around: +1 right, -1 left. Away from known obstacles near
+        the front; else toward [prefer] (e.g. the side the target is on); else random."""
+        score = {1: 0.0, -1: 0.0}
+        for m in self.obstacles():
+            rel, d = m["relative_deg"], m.get("distance_cm") or 100
+            if abs(rel) < 100 and d < 120:
+                side = 1 if rel > 0 else -1
+                score[side] += m["confidence"] * (1 - abs(rel) / 100) * (120 - d) / 120
+        if abs(score[1] - score[-1]) > 0.05:
+            return 1 if score[1] < score[-1] else -1
+        return prefer or random.choice([1, -1])
+
+    def go_around(self, prefer: int = 0, back_up: bool = True) -> int | None:
+        """Stuck (or about to drive into a known obstacle): back up, sidestep past it on
+        the clearer side, and face the original way again. Returns the side taken
+        (+1 right / -1 left), or None if both sides were blocked."""
+        if back_up:
+            print("   [stuck: backing up to go around it]")
+            self.post("agent", "Stuck! Backing up to go around")
+            self.chirp("alert")
+            self.back_up(BACKUP_CM)
+        else:
+            self.post("agent", "Going around an obstacle")
+        first = self.pick_side(prefer)
+        for side in (first, -first):
+            self.turn(side * DETOUR_DEG, quick=True)
+            clear = True
+            try:
+                clear = floor_clear(self.snap().jpeg)     # ~1 s yes/no from the vision model
+            except Exception:
+                pass
+            if not clear or self.obstacle_ahead(DETOUR_CM):
+                print(f"   [detour: {'right' if side > 0 else 'left'} side blocked]")
+                self.turn(-side * DETOUR_DEG, quick=True)
+                continue
+            text = self.tools.run("drive", {"distance_cm": DETOUR_CM})[0]["text"]
+            print(f"   [detour {'right' if side > 0 else 'left'}: {text}]")
+            self.turn(-side * DETOUR_DEG, quick=True)     # face the original way again
+            if "stuck" in text:
+                continue                                  # stuck again on this side: try the other
+            return side
+        self.post("agent", "Couldn't find a way around")
+        self.chirp("sad")
+        return None
 
     def has_motors(self) -> bool:
         if self.tools.movement == "sim":
@@ -682,6 +795,7 @@ def _wheel(v: float) -> float:
 MODEL_CHECK_S = 3.0      # the model confirms the target this often (fixes tracker drift)
 DETECT_MISSES = 6        # detector tracking: this many frames in a row without it = lost
 RADAR_PERIOD_S = 0.6     # background detector -> radar update rate
+HINT_S = 3.0             # a glance's box is good for this long (then search again)
 MAX_STEER = 0.2          # gentle steering while driving: keeps the view steady for the tracker
 SPIN_OFFSET = 0.25       # further off-centre than this: stop and turn toward it in pulses
 SPIN_PULSE_MS = 150
@@ -714,6 +828,8 @@ def describe_memory(m: dict) -> str:
     side = ("straight ahead" if abs(rel) < 12 else "behind you" if abs(rel) > 155
             else f"{abs(rel):.0f} deg to your {'right' if rel > 0 else 'left'}")
     dist = f", ~{m['distance_cm'] / 100:.1f} m" if m.get("distance_cm") is not None else ""
+    if m.get("kind") == "obstacle":
+        return f"- OBSTACLE (you got stuck here {_ago(m['age_s'])}): {side}{dist}"
     return f"- {m['thing']}: {side}{dist}, seen {_ago(m['age_s'])} ({_sure(m['confidence'])})"
 
 
@@ -768,6 +884,7 @@ def _drive_tracking(d: Droid, target: str, box: Box, jpeg: bytes, frame, follow:
     and on a bump or tilt."""
     t_end = time.time() + max_s
     reached = False
+    detours = 0
     try:
         while time.time() < t_end:
             result = _track(d, target, box, jpeg, follow, t_end, reached)
@@ -775,6 +892,12 @@ def _drive_tracking(d: Droid, target: str, box: Box, jpeg: bytes, frame, follow:
                 return f"reached the {target}"
             if result.startswith("arrived"):
                 reached = True
+            if result == "detour":
+                detours += 1
+                if detours > MAX_DETOURS:
+                    return f"kept getting stuck on the way to the {target}"
+                print(f"   [track: went around an obstacle; finding the {target} again]")
+                result = "lost"
             if result in ("lost", "arrived, then lost"):
                 d.bridge.stop()
                 d.show(None, "", f"lost the {target}, scanning...", "red")
@@ -800,6 +923,7 @@ def _track(d: Droid, target: str, box: Box, jpeg: bytes, follow: bool, t_end: fl
     tracker = None if detect else Tracker(decode(jpeg, width), box)
     b = box
     misses = 0
+    last_avoid = 0.0
     last_check = last_mark = time.time()
     last_print = 0.0
     while time.time() < t_end:
@@ -854,11 +978,29 @@ def _track(d: Droid, target: str, box: Box, jpeg: bytes, follow: bool, t_end: fl
             turn = max(-MAX_STEER, min(MAX_STEER, STEER_GAIN * offset))
             left, right = _wheel(fwd + turn), _wheel(fwd - turn)
             r = d.velocity(left, right, ttl_ms=400)
+        if r.get("ended") == "bump" and not b.near(target) and fwd > 0:
+            # Ran into something on the way (not the target itself): go around it
+            d.bridge.stop()
+            side = d.go_around(prefer=1 if offset > 0 else -1)
+            return "detour" if side is not None else f"ran into something on the way to the {target}"
         if r.get("ended") in ("bump", "tilt"):
             return f"stopped on a {r['ended']} on the way to the {target}"
+        if r.get("ended") == "blocked":                 # couldn't spin that way
+            d.bridge.stop()
+            d.back_up(BACKUP_CM)                         # free the corner, then carry on
+            continue
+        if fwd > 0 and abs(offset) <= SPIN_OFFSET and time.time() - last_avoid > 1.0:
+            last_avoid = time.time()
+            ob = d.obstacle_ahead(AVOID_CM)              # a place we got stuck before?
+            if ob:
+                d.bridge.stop()
+                print(f"   [track: marked obstacle {ob['distance_cm']:.0f} cm ahead; going around]")
+                side = d.go_around(prefer=1 if offset > 0 else -1, back_up=False)
+                return "detour" if side is not None else f"an obstacle blocks the way to the {target}"
         if r.get("ended") == "stuck":
-            d.back_up(BACKUP_CM)
-            return f"got stuck on the way to the {target} (no forward progress), so backed up"
+            d.bridge.stop()
+            side = d.go_around(prefer=1 if offset > 0 else -1)   # pass on the target's side
+            return "detour" if side is not None else f"got stuck on the way to the {target} and couldn't get around"
         d.show(b, target, f"{'following' if follow else 'going to'} {target}  off-centre "
                           f"{offset:+.2f}  wheels {left:+.2f}/{right:+.2f}"
                           f"{'  (close)' if b.near(target) else ''}", "green")
@@ -892,15 +1034,19 @@ def approach_target(d: Droid, target: str, follow: bool = False, max_s: float = 
     """Find the target, face it, then drive to it (and keep following) with tracking."""
     if announce:
         d.goal = f"{'follow' if follow else 'go to'} the {target}"
-    box = _search(d, target)
+    box = d.take_hint(target) or _search(d, target)     # just seen it? go straight there
     if box is None:
         if announce:
             d.say(f"You looked all around but couldn't find the {target}.", speak=True)
         return f"couldn't find the {target} anywhere around"
-    box = _aim(d, target, box) or box
-    d.remember(target)
+    if not d.can_detect(target):
+        box = _aim(d, target, box) or box   # tracking everyday things steers from anywhere in view
     jpeg, frame = d.frame()
-    found, path_clear = locate_with_path(jpeg, target)
+    if d.can_detect(target):
+        # Fast path: the detector re-finds it; obstacles are handled by stuck detection
+        found, path_clear = d.det.find(jpeg, target, last=box), True
+    else:
+        found, path_clear = locate_with_path(jpeg, target)
     box = found or box
     if not follow and not box.near(target) and not path_clear:
         if announce:
@@ -952,8 +1098,22 @@ def explore(d: Droid, target: str | None) -> str:
     """Wander around: drive where it's clear, turn where it isn't."""
     d.goal = "explore the room"
     seen: list[str] = []
-    for _ in range(6):
-        p = d.look()
+    for step in range(8):
+        # Quick: detector glance + yes/no floor check (~1 s). A full look every 3rd step.
+        if step % 3 == 2:
+            p = d.look()
+        else:
+            snap, dets = d.glance()
+            p = d.glance_perception(dets)
+            if not (p.person or p.pet):
+                try:
+                    p.floor_ahead_clear = floor_clear(snap.jpeg)
+                except Exception:
+                    p.floor_ahead_clear = False
+            for x in dets:                  # leave a hint so a follow-up mission starts there
+                if x.label == "person" or x.label in PETS:
+                    d.give_hint(x.label, x.box)
+                    break
         if p.person:
             return "while exploring, found a human"
         if p.pet:
@@ -961,7 +1121,7 @@ def explore(d: Droid, target: str | None) -> str:
         if p.interesting and p.interesting not in seen:
             seen.append(p.interesting)
         if not d.drive(DRIVE_CM, p):
-            d.turn(random.choice([60, 90, -60, -90]))
+            d.turn(random.choice([60, 90, -60, -90]), quick=True)
     if seen:
         d.say("While exploring you saw: " + ", ".join(seen[-3:]) + ".")
     return "explored and saw: " + ", ".join(seen[-4:]) if seen else "explored but found nothing new"

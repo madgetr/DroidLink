@@ -52,6 +52,32 @@ def allowed_missions(history: list[Memory], p: Perception) -> list[str]:
     return allowed
 
 
+def reflex(d: Droid, history: list[Memory]) -> tuple[dict | None, Perception]:
+    """Quick decisions without the vision model: a detector glance (~0.2 s).
+    Sees a pet -> go to it. Sees a person it hasn't greeted lately -> greet them.
+    A person on the radar a moment ago -> go greet them (the search starts there).
+    Returns (choice or None, what the glance saw)."""
+    snap, dets = d.glance()
+    p = d.glance_perception(dets)
+    recent = [h.mission for h in history[-4:]]
+    recent_targets = [h.outcome for h in history[-3:]]
+    pet = next((x for x in dets if x.label in ("dog", "cat") and x.conf >= 0.5), None)
+    person = next((x for x in dets if x.label == "person" and x.conf >= 0.45), None)
+    if pet and not any(pet.label in o for o in recent_targets):
+        d.give_hint(pet.label, pet.box)
+        return {"mission": "approach_target", "target": pet.label,
+                "reason": f"reflex: a {pet.label} right there!"}, p
+    if person and "greet_human" not in recent:
+        d.give_hint("person", person.box)
+        return {"mission": "greet_human", "target": "person", "reason": "reflex: a human!"}, p
+    m = d.recall_one("person")
+    if (not person and m and m["confidence"] >= 0.6 and m["age_s"] < 15
+            and "greet_human" not in recent):
+        return {"mission": "greet_human", "target": "person",
+                "reason": f"reflex: a human was {m['relative_deg']:+.0f} deg a moment ago"}, p
+    return None, p
+
+
 def pick_mission(d: Droid, p: Perception, history: list[Memory]) -> dict:
     allowed = allowed_missions(history, p)
     menu = "\n".join(f"- {name}: {MISSIONS[name][1]}" for name in allowed)
@@ -159,8 +185,11 @@ def run_one(d: Droid, args, history: list[Memory]) -> tuple[str, str]:
     elif args.mission:
         choice = {"mission": args.mission, "target": args.target, "reason": "requested"}
     else:
-        p = d.look()
-        choice = pick_mission(d, p, history)
+        choice, p = reflex(d, history)       # fast: something worth going to right now?
+        if choice:
+            d.chirp("excited")
+        else:
+            choice = pick_mission(d, p, history)   # nothing urgent: let the model choose
     target = (choice.get("target") or "").strip() or None
     print(f"\n>>> {choice['mission'].upper()}{f' [{target}]' if target else ''}: {choice['reason']}")
     d.post("agent", f"Mission: {choice['mission'].replace('_', ' ')}{f' ({target})' if target else ''}")

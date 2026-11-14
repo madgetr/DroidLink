@@ -48,6 +48,17 @@ class BridgeService : Service() {
         odometry = Odometry(sensors, { droid.left to droid.right }, settings)
         world = WorldMemory(odometry)
         motion = MotionController(sensors, droid, settings).also { it.camera = camera; it.odometry = odometry }
+        odometry.view = { camera.fingerprintIfOpen(motion.progressCamera) }
+        // Stuck = something in front of us the camera may not even show (a low edge,
+        // a rug, a chair leg): mark it on the radar just ahead of the droid's nose
+        motion.onStuck = { relDeg ->
+            try {
+                val yaw = sensors.yaw.takeUnless { it.isNaN() } ?: 0.0
+                world.see("obstacle", yaw + relDeg, null, 90.0, OBSTACLE_AHEAD_CM, 0.9, "obstacle")
+                log.add("droid", if (relDeg == 0.0) "Stuck on something ahead: marked an obstacle"
+                                 else "Couldn't turn ${if (relDeg > 0) "right" else "left"}: marked an obstacle", false)
+            } catch (_: Exception) {}
+        }
         sound = SoundHub(this)
         gestures = Gestures({ droid }, motion, settings) { mood ->
             try { sound.chirp(mood, null) } catch (_: Exception) {}
@@ -220,7 +231,7 @@ class BridgeService : Service() {
                 p["turn_power"]?.toFloatOrNull(), p["drive_power"]?.toFloatOrNull(),
                 p["min_power"]?.toFloatOrNull(), p["cm_per_second"]?.toFloatOrNull(),
                 p["coast_s"]?.toFloatOrNull(), p["ramp_ms"]?.toIntOrNull(),
-                p["ease_deg"]?.toFloatOrNull()))
+                p["ease_deg"]?.toFloatOrNull(), p["reverse_power"]?.toFloatOrNull()))
             path == "/control/spin_test" -> Json(motion.spinTest(
                 num("power").coerceIn(-1.0, 1.0), p["seconds"]?.toDoubleOrNull() ?: 0.6,
                 head = p["part"] == "head"))
@@ -424,6 +435,7 @@ class BridgeService : Service() {
 
     companion object {
         const val PORT = 8765
+        private const val OBSTACLE_AHEAD_CM = 22.0   // camera to just past the droid's front
         private val ACKS = listOf("What's up?", "Yes?", "You called?", "I'm listening!",
             "Hmm? What is it?", "Right here!", "What do you need?")
         private const val CHANNEL = "bridge"

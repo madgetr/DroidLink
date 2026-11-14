@@ -45,6 +45,11 @@ class Settings(ctx: Context) {
     var drivePower: Float
         get() = prefs.getFloat("drive_power", 0.6f)
         set(v) = prefs.edit().putFloat("drive_power", v.coerceIn(0.1f, 1f)).commit().let {}
+    /** Backing up: more power than driving, since reversing off whatever we hit
+     *  (a mat edge, a chair leg) takes a push. */
+    var reversePower: Float
+        get() = prefs.getFloat("reverse_power", 0.85f)
+        set(v) = prefs.edit().putFloat("reverse_power", v.coerceIn(0.1f, 1f)).commit().let {}
     var minPower: Float
         get() = prefs.getFloat("min_power", 0.28f)
         set(v) = prefs.edit().putFloat("min_power", v.coerceIn(0f, 1f)).commit().let {}

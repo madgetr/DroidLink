@@ -239,20 +239,24 @@ class CameraHub(ctx: Context, private val ambientLux: () -> Float?) {
         lastUse = System.currentTimeMillis()
         ensureOpen(id)
         val f = latest ?: return null
-        val gw = 16; val gh = 12
+        val gw = FP_W; val gh = FP_H
         val out = IntArray(gw * gh)
         val bw = f.width / gw; val bh = f.height / gh
         for (gy in 0 until gh) for (gx in 0 until gw) {
             var sum = 0; var n = 0
             // Average each block (sampled) so motor vibration doesn't look like motion
-            for (y in gy * bh until (gy + 1) * bh step 6) {
+            for (y in gy * bh until (gy + 1) * bh step 4) {
                 val row = y * f.width
-                for (x in gx * bw until (gx + 1) * bw step 6) { sum += f.nv21[row + x].toInt() and 0xff; n++ }
+                for (x in gx * bw until (gx + 1) * bw step 4) { sum += f.nv21[row + x].toInt() and 0xff; n++ }
             }
             out[gy * gw + gx] = if (n == 0) 0 else sum / n
         }
         return out
     }
+
+    /** [fingerprint], but only if camera [id] is already running (never opens it). */
+    fun fingerprintIfOpen(id: String): IntArray? =
+        if (openId == id && device != null && System.currentTimeMillis() - lastUse < 5_000) fingerprint(id) else null
 
     /** Average brightness (0-255) of a frame, sampled on a coarse grid. */
     private fun luma(f: Frame): Int {
@@ -435,3 +439,7 @@ class CameraHub(ctx: Context, private val ambientLux: () -> Float?) {
         private const val BRIGHT_LUX = 60f                // room light at which the flashlight goes off
     }
 }
+
+/** Size of a view fingerprint (see CameraHub.fingerprint, MotionController.viewChange). */
+const val FP_W = 32
+const val FP_H = 24

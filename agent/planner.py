@@ -219,7 +219,13 @@ class Mission:
         if skill == "drive":
             cm = _number(arg, 40)
             p = d.look()
-            return f"drove about {cm:.0f} cm" if d.drive(cm, p) else "didn't drive: the way ahead isn't clear"
+            before = len(d.obstacles())
+            if not d.drive(cm, p):
+                return "didn't drive: the way ahead isn't clear"
+            if len(d.obstacles()) > before:
+                return (f"got stuck on something while driving (marked as an obstacle on your "
+                        f"radar), backed up and went around it")
+            return f"drove about {cm:.0f} cm"
         if skill == "back_up":
             return d.back_up(_number(arg, 20))
         if skill == "say":
